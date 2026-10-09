@@ -1,6 +1,22 @@
 use std::{io};
 
-use axum::{Router, http::StatusCode, routing::{get, post}};
+use axum::{Json, Router, http::StatusCode, routing::{get, post}};
+use serde::Deserialize;
+
+#[derive(Deserialize, Debug)]
+struct SampleChunk {
+    started_at: u64, // in milliseconds
+    samples: Vec<Sample>
+}
+
+#[derive(Deserialize, Debug)]
+struct Sample {
+    x: f64,
+    y: f64,
+    z: f64,
+    latitude: f64,
+    longitude: f64   
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -12,8 +28,9 @@ async fn main() -> io::Result<()> {
     axum::serve(listener, app).await
 }
 
-async fn post_readings() -> StatusCode {
+async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> StatusCode {
     println!("POST readings");
+
     StatusCode::OK
 }
 
