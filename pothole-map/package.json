@@ -1,0 +1,13 @@
+{
+  "name": "pothole-map",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive map of reported potholes (Leaflet + OpenStreetMap)",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
