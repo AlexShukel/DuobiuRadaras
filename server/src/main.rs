@@ -8,7 +8,7 @@ const WINDOW_SIZE: usize = 20;
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
 const POTHOLES_PATH: &str = "./potholes.json";
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
 struct PotholeLocation {
     latitude: f64,
     longitude: f64,
@@ -83,19 +83,40 @@ async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCo
         .reduce(f64::min)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let detections = detect_potholes(&vertical_axis, threshold);
+    let locations = detect_pothole_locations(&sample_chunk, threshold);
 
-    for index in detections {
-        let sample = &sample_chunk.samples[index];
-
-        println!(
-            "Possible pothole at sample {index}: latitude={}, longitude={}",
-            sample.latitude,
-            sample.longitude
-        );
+    if locations.iter().any(|location| {
+        !location.latitude.is_finite()
+            || !location.longitude.is_finite()
+            || !(-90.0..=90.0).contains(&location.latitude)
+            || !(-180.0..=180.0).contains(&location.longitude)
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
+    save_potholes(locations)?;
+
     Ok(StatusCode::OK)
+}
+
+fn detect_pothole_locations(
+    chunk: &SampleChunk,
+    threshold: f64,
+) -> Vec<PotholeLocation> {
+    let vertical_axis: Vec<f64> =
+        chunk.samples.iter().map(|sample| sample.z).collect();
+
+    detect_potholes(&vertical_axis, threshold)
+        .into_iter()
+        .map(|index| {
+            let sample = &chunk.samples[index];
+
+            PotholeLocation {
+                latitude: sample.latitude,
+                longitude: sample.longitude,
+            }
+        })
+        .collect()
 }
 
 fn detect_potholes(vertical_axis: &[f64], threshold: f64) -> Vec<usize> {
@@ -145,9 +166,12 @@ async fn post_calibration(
     Ok(StatusCode::OK)
 }
 
-async fn get_potholes() -> StatusCode {
-    println!("GET potholes");
-    StatusCode::OK
+async fn get_potholes() -> Result<Json<Vec<PotholeLocation>>, StatusCode> {
+    let _guard = POTHOLES_FILE_LOCK
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(read_potholes()?))
 }
 
 fn average(readings: &[f64]) -> f64 {
@@ -177,6 +201,42 @@ fn calibration_threshold(vertical_axis: &[f64]) -> Option<f64> {
         .windows(WINDOW_SIZE)
         .map(stdev)
         .reduce(f64::max)
+}
+
+static POTHOLES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_potholes() -> Result<Vec<PotholeLocation>, StatusCode> {
+    match fs::read_to_string(POTHOLES_PATH) {
+        Ok(json) => serde_json::from_str(&json)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(Vec::new())
+        }
+
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
+    if locations.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = POTHOLES_FILE_LOCK
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut potholes = read_potholes()?;
+    potholes.extend(locations);
+
+    let json = serde_json::to_string_pretty(&potholes)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    fs::write(POTHOLES_PATH, json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -280,5 +340,65 @@ mod tests {
 
             assert_eq!(calibration_threshold(&readings), None);
         }
+    }
+
+    fn sample_chunk_with_distinct_locations() -> SampleChunk {
+        SampleChunk {
+            started_at: 0,
+            samples: (0..60)
+                .map(|index| Sample {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 9.8,
+                    latitude: index as f64,
+                    longitude: -(index as f64),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn detected_location_matches_last_sample_of_flagged_window() {
+        let mut chunk = sample_chunk_with_distinct_locations();
+
+        // An impact at the final sample flags only the final window.
+        chunk.samples[59].z = 19.8;
+
+        let locations = detect_pothole_locations(&chunk, 2.0);
+
+        assert_eq!(
+            locations,
+            vec![PotholeLocation {
+                latitude: 59.0,
+                longitude: -59.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn overlapping_detections_map_to_correct_sample_locations() {
+        let mut chunk = sample_chunk_with_distinct_locations();
+        chunk.samples[30].z = 19.8;
+
+        let locations = detect_pothole_locations(&chunk, 2.0);
+
+        // Windows containing sample 30 end at indices 30 through 49.
+        let expected: Vec<PotholeLocation> = (30..=49)
+            .map(|index| PotholeLocation {
+                latitude: index as f64,
+                longitude: -(index as f64),
+            })
+            .collect();
+
+        assert_eq!(locations, expected);
+    }
+
+    #[test]
+    fn smooth_chunk_returns_no_pothole_locations() {
+        let chunk = sample_chunk_with_distinct_locations();
+
+        let locations = detect_pothole_locations(&chunk, 2.0);
+
+        assert!(locations.is_empty());
     }
 }
