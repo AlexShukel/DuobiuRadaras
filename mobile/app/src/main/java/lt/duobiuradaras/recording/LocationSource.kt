@@ -25,9 +25,18 @@ class LocationSource(private val context: Context) {
     /** Null until the first fix after [start]; the first non-null value marks the first fix. */
     val latest: StateFlow<GeoPoint?> = _latest.asStateFlow()
 
+    private val _lastFixAtMillis = MutableStateFlow<Long?>(null)
+
+    /**
+     * `SystemClock.elapsedRealtime()` of the latest fix. Emits for every fix,
+     * unlike [latest], which skips fixes with unchanged coordinates.
+     */
+    val lastFixAtMillis: StateFlow<Long?> = _lastFixAtMillis.asStateFlow()
+
     private val listener = object : LocationListenerCompat {
         override fun onLocationChanged(location: Location) {
             _latest.value = GeoPoint(location.latitude, location.longitude)
+            _lastFixAtMillis.value = location.elapsedRealtimeNanos / 1_000_000
         }
     }
 

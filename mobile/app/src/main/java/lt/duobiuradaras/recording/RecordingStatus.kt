@@ -18,6 +18,14 @@ data class RecordingState(
     /** Null until the first fix after recording was switched on. */
     val location: GeoPoint? = null,
     val acceleration: Acceleration? = null,
+    /** Measured accelerometer event rate over the last second; null until measured. */
+    val accelerometerHz: Float? = null,
+    /** `SystemClock.elapsedRealtime()` of the latest GPS fix; null before the first. */
+    val lastFixAtMillis: Long? = null,
+    /** `SystemClock.elapsedRealtime()` when the last 2xx packet response arrived. */
+    val lastPacketSentAtMillis: Long? = null,
+    /** How long the last successful packet upload took, request to response. */
+    val lastPacketSendMillis: Long? = null,
 )
 
 /**

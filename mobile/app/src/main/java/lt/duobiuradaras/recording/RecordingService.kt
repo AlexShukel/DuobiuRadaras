@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -97,8 +98,16 @@ class RecordingService : LifecycleService() {
                 sampler.run { packet ->
                     // Each upload runs on its own so a slow server never delays sampling.
                     launch {
+                        val startedAt = SystemClock.elapsedRealtime()
                         if (sender.send(packet)) {
-                            RecordingStatus.update { it.copy(sentPackets = it.sentPackets + 1) }
+                            val sentAt = SystemClock.elapsedRealtime()
+                            RecordingStatus.update {
+                                it.copy(
+                                    sentPackets = it.sentPackets + 1,
+                                    lastPacketSentAtMillis = sentAt,
+                                    lastPacketSendMillis = sentAt - startedAt,
+                                )
+                            }
                         }
                     }
                 }
@@ -106,6 +115,24 @@ class RecordingService : LifecycleService() {
             launch {
                 location.latest.filterNotNull().collect { point ->
                     RecordingStatus.update { it.copy(location = point) }
+                }
+            }
+            launch {
+                location.lastFixAtMillis.filterNotNull().collect { fixAt ->
+                    RecordingStatus.update { it.copy(lastFixAtMillis = fixAt) }
+                }
+            }
+            launch {
+                var lastCount = accelerometer.eventCount
+                var lastAt = SystemClock.elapsedRealtime()
+                while (isActive) {
+                    delay(ACCELEROMETER_RATE_PERIOD)
+                    val count = accelerometer.eventCount
+                    val now = SystemClock.elapsedRealtime()
+                    val hz = (count - lastCount) * 1000f / (now - lastAt).coerceAtLeast(1)
+                    RecordingStatus.update { it.copy(accelerometerHz = hz) }
+                    lastCount = count
+                    lastAt = now
                 }
             }
             launch {
@@ -172,6 +199,7 @@ class RecordingService : LifecycleService() {
         private const val TAG = "RecordingService"
         private const val WAKE_LOCK_TAG = "DuobiuRadaras:recording"
         private val UI_ACCELERATION_PERIOD = 100.milliseconds
+        private val ACCELEROMETER_RATE_PERIOD = 1000.milliseconds
 
         private const val ACTION_START = "lt.duobiuradaras.action.START"
         private const val ACTION_STOP = "lt.duobiuradaras.action.STOP"

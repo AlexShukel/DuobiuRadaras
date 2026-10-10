@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.annotation.StringRes
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,13 +29,16 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -50,11 +54,13 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import lt.duobiuradaras.R
 import lt.duobiuradaras.recording.Acceleration
 import lt.duobiuradaras.recording.GeoPoint
 import lt.duobiuradaras.recording.RecordingState
+import lt.duobiuradaras.recording.RoadLabel
 import lt.duobiuradaras.ui.theme.DuobiuRadarasTheme
 
 /** Location permissions must be requested together; only fine location is required to record. */
@@ -81,6 +87,23 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val locationDeniedMessage = stringResource(R.string.location_permission_denied)
+    val labelSentMessages = mapOf(
+        RoadLabel.POTHOLE to stringResource(R.string.label_sent_pothole),
+        RoadLabel.BUMP to stringResource(R.string.label_sent_bump),
+    )
+    val labelFailedMessage = stringResource(R.string.label_send_failed)
+
+    LaunchedEffect(viewModel) {
+        viewModel.labelResultEvents.collect { result ->
+            // Launched so a burst of presses doesn't queue snackbars behind each other.
+            launch {
+                snackbarHostState.currentSnackbarData?.dismiss()
+                snackbarHostState.showSnackbar(
+                    if (result.success) labelSentMessages.getValue(result.label) else labelFailedMessage,
+                )
+            }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -97,8 +120,9 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
 
     MainScreen(
         state = state,
-        endpointUrlField = viewModel.endpointUrlField,
+        serverUrlField = viewModel.serverUrlField,
         snackbarHostState = snackbarHostState,
+        onLabel = viewModel::sendLabel,
         onToggleRecording = {
             if (state.recording.isRecording) {
                 viewModel.stopRecording()
@@ -117,9 +141,10 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
 @Composable
 fun MainScreen(
     state: MainUiState,
-    endpointUrlField: TextFieldState,
+    serverUrlField: TextFieldState,
     snackbarHostState: SnackbarHostState,
     onToggleRecording: () -> Unit,
+    onLabel: (RoadLabel) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -140,29 +165,30 @@ fun MainScreen(
                 text = stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineMedium,
             )
-            EndpointUrlField(state = state, field = endpointUrlField)
+            ServerUrlField(state = state, field = serverUrlField)
             RecordingToggleButton(
                 isRecording = state.recording.isRecording,
                 enabled = state.recording.isRecording || state.canStart,
                 onClick = onToggleRecording,
             )
+            LabelButtons(enabled = state.canLabel, onLabel = onLabel)
             LiveStatusCard(recording = state.recording)
         }
     }
 }
 
 @Composable
-private fun EndpointUrlField(state: MainUiState, field: TextFieldState) {
+private fun ServerUrlField(state: MainUiState, field: TextFieldState) {
     val supportingTextRes = when {
-        state.showUrlError -> R.string.endpoint_url_invalid
-        state.recording.isRecording -> R.string.endpoint_url_locked
+        state.showUrlError -> R.string.server_url_invalid
+        state.recording.isRecording -> R.string.server_url_locked
         else -> null
     }
     OutlinedTextField(
         state = field,
         modifier = Modifier.fillMaxWidth(),
         enabled = state.isUrlEditable,
-        label = { Text(stringResource(R.string.endpoint_url_label)) },
+        label = { Text(stringResource(R.string.server_url_label)) },
         supportingText = if (supportingTextRes != null) {
             { Text(stringResource(supportingTextRes)) }
         } else {
@@ -176,6 +202,30 @@ private fun EndpointUrlField(state: MainUiState, field: TextFieldState) {
         ),
         lineLimits = TextFieldLineLimits.SingleLine,
     )
+}
+
+/** Manual pothole / bump labels for training data (SPEC.md 6.4). */
+@Composable
+private fun LabelButtons(enabled: Boolean, onLabel: (RoadLabel) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        OutlinedButton(
+            onClick = { onLabel(RoadLabel.POTHOLE) },
+            modifier = Modifier.weight(1f),
+            enabled = enabled,
+        ) {
+            Text(stringResource(R.string.label_pothole))
+        }
+        OutlinedButton(
+            onClick = { onLabel(RoadLabel.BUMP) },
+            modifier = Modifier.weight(1f),
+            enabled = enabled,
+        ) {
+            Text(stringResource(R.string.label_bump))
+        }
+    }
 }
 
 @Composable
@@ -204,6 +254,19 @@ private fun RecordingToggleButton(isRecording: Boolean, enabled: Boolean, onClic
 @Composable
 private fun LiveStatusCard(recording: RecordingState) {
     val placeholder = stringResource(R.string.status_placeholder)
+    // Ticks while recording so the "ago" values count up between updates.
+    val now by produceState(SystemClock.elapsedRealtime(), recording.isRecording) {
+        while (recording.isRecording) {
+            value = SystemClock.elapsedRealtime()
+            delay(AGE_REFRESH_MILLIS)
+        }
+    }
+
+    @Composable
+    fun ago(atMillis: Long?): String = when {
+        !recording.isRecording || atMillis == null -> placeholder
+        else -> stringResource(R.string.status_ago_value, (now - atMillis).coerceAtLeast(0) / 1000f)
+    }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -220,6 +283,17 @@ private fun LiveStatusCard(recording: RecordingState) {
                 label = stringResource(R.string.status_sent_packets),
                 value = if (recording.isRecording) recording.sentPackets.toString() else placeholder,
             )
+            StatusRow(
+                label = stringResource(R.string.status_last_packet_sent),
+                value = ago(recording.lastPacketSentAtMillis),
+            )
+            StatusRow(
+                label = stringResource(R.string.status_last_packet_send_time),
+                value = recording.lastPacketSendMillis
+                    ?.takeIf { recording.isRecording }
+                    ?.let { stringResource(R.string.status_millis_value, it) }
+                    ?: placeholder,
+            )
             HorizontalDivider()
             val location = recording.location
             StatusRow(
@@ -234,6 +308,10 @@ private fun LiveStatusCard(recording: RecordingState) {
                     )
                 },
             )
+            StatusRow(
+                label = stringResource(R.string.status_last_gps_fix),
+                value = ago(recording.lastFixAtMillis),
+            )
             HorizontalDivider()
             Text(
                 text = stringResource(R.string.status_accelerometer),
@@ -243,9 +321,18 @@ private fun LiveStatusCard(recording: RecordingState) {
             AccelerationRow(R.string.status_axis_x, acceleration?.x, placeholder)
             AccelerationRow(R.string.status_axis_y, acceleration?.y, placeholder)
             AccelerationRow(R.string.status_axis_z, acceleration?.z, placeholder)
+            StatusRow(
+                label = stringResource(R.string.status_accelerometer_rate),
+                value = recording.accelerometerHz
+                    ?.takeIf { recording.isRecording }
+                    ?.let { stringResource(R.string.status_hz_value, it) }
+                    ?: placeholder,
+            )
         }
     }
 }
+
+private const val AGE_REFRESH_MILLIS = 100L
 
 @Composable
 private fun AccelerationRow(@StringRes axisLabel: Int, value: Float?, placeholder: String) {
@@ -288,9 +375,10 @@ private fun MainScreenStoppedPreview() {
     DuobiuRadarasTheme {
         MainScreen(
             state = MainUiState(isLoaded = true, isUrlValid = true),
-            endpointUrlField = rememberTextFieldState("http://100.72.8.35:3000/api/raw"),
+            serverUrlField = rememberTextFieldState("http://100.72.8.35:3000"),
             snackbarHostState = remember { SnackbarHostState() },
             onToggleRecording = {},
+            onLabel = {},
         )
     }
 }
@@ -308,11 +396,16 @@ private fun MainScreenRecordingPreview() {
                     sentPackets = 42,
                     location = GeoPoint(latitude = 54.687157, longitude = 25.279652),
                     acceleration = Acceleration(x = 0.12f, y = -0.31f, z = 9.81f),
+                    accelerometerHz = 99.8f,
+                    lastFixAtMillis = SystemClock.elapsedRealtime() - 400,
+                    lastPacketSentAtMillis = SystemClock.elapsedRealtime() - 1_200,
+                    lastPacketSendMillis = 87,
                 ),
             ),
-            endpointUrlField = rememberTextFieldState("http://100.72.8.35:3000/api/raw"),
+            serverUrlField = rememberTextFieldState("http://100.72.8.35:3000"),
             snackbarHostState = remember { SnackbarHostState() },
             onToggleRecording = {},
+            onLabel = {},
         )
     }
 }

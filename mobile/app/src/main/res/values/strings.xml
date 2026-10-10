@@ -2,14 +2,21 @@
     <string name="app_name">DuobiuRadaras</string>
 
     <!-- Endpoint setting (SPEC.md 6.1) -->
-    <string name="endpoint_url_label">Raw data URL</string>
-    <string name="endpoint_url_invalid">Enter a full http:// or https:// URL</string>
-    <string name="endpoint_url_locked">Stop recording to change the URL</string>
+    <string name="server_url_label">Server URL</string>
+    <string name="server_url_invalid">Enter a full http:// or https:// URL</string>
+    <string name="server_url_locked">Stop recording to change the URL</string>
 
     <!-- Recording toggle (SPEC.md 6.2) -->
     <string name="recording_start">Record raw data</string>
     <string name="recording_stop">Stop recording</string>
     <string name="location_permission_denied">Precise location permission is required to record</string>
+
+    <!-- Manual labels (SPEC.md 6.4) -->
+    <string name="label_pothole">Pothole</string>
+    <string name="label_bump">Bump</string>
+    <string name="label_sent_pothole">Pothole labelled</string>
+    <string name="label_sent_bump">Bump labelled</string>
+    <string name="label_send_failed">Could not send label</string>
 
     <!-- Live status (SPEC.md 6.3) -->
     <string name="status_placeholder">—</string>
@@ -26,4 +33,12 @@
     <string name="status_axis_y">y</string>
     <string name="status_axis_z">z</string>
     <string name="status_acceleration_value">%1$+.2f</string>
+    <string name="status_last_packet_sent">Last packet sent</string>
+    <string name="status_last_packet_send_time">Last packet upload time</string>
+    <string name="status_last_gps_fix">Last GPS fix</string>
+    <string name="status_accelerometer_rate">Rate</string>
+    <!-- seconds since an event -->
+    <string name="status_ago_value">%1$.1f s ago</string>
+    <string name="status_millis_value">%1$d ms</string>
+    <string name="status_hz_value">%1$.0f Hz</string>
 </resources>

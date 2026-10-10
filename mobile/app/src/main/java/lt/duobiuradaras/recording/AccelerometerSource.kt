@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,10 +20,16 @@ class AccelerometerSource(context: Context) {
     /** Null until the first sensor event after [start]. */
     val latest: StateFlow<Acceleration?> = _latest.asStateFlow()
 
+    private val _eventCount = AtomicLong()
+
+    /** Sensor events received since [start]; used to measure the actual rate. */
+    val eventCount: Long get() = _eventCount.get()
+
     private val listener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
             val values = event.values
             _latest.value = Acceleration(values[0], values[1], values[2])
+            _eventCount.incrementAndGet()
         }
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit

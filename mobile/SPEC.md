@@ -132,21 +132,38 @@ next packet starts at `17:44:02.123Z`.
 - Body: the packet JSON above
 - Header: `Content-Type: application/json`
 - No authentication.
-- Endpoint URL: set by the user in the app (see 6.1), not hard-coded.
+- Endpoint URL: the server URL set in the app (see 6.1) followed by `api/raw`,
+  e.g. `http://100.72.8.35:3000/api/raw`.
 - One packet is sent every 2 seconds while recording is active.
 - **Success:** any `2xx` response. Each success increases the sent-packet counter (see 6.3).
 - **Failure:** a non-`2xx` response or a network error. The packet is dropped
   (no retry, no offline storage) and recording continues.
 
+### 5.1 Manual labels
+
+- Method: `POST`, header `Content-Type: application/json`, no authentication.
+- Endpoint URL: the server URL (6.1) followed by `api/label`,
+  e.g. `http://100.72.8.35:3000/api/label`.
+- Body:
+
+  ```json
+  {"timestamp":1760100000000,"latitude":54.6872,"longitude":25.2797,"label":"pothole"}
+  ```
+
+  - `timestamp`: Unix epoch milliseconds when the button was pressed.
+  - `latitude`, `longitude`: latest GPS fix, WGS 84 degrees.
+  - `label`: `"pothole"` or `"bump"`.
+- One request per button press. No retry; the result is shown as a snackbar.
+
 ## 6. User interface
 
 A single screen.
 
-### 6.1 Endpoint setting
+### 6.1 Server setting
 
-- A text field labelled **Raw data URL** with the full endpoint URL.
-- Pre-filled with a test URL: `http://100.72.8.35:3000/api/raw` (the backend's
-  raw data route).
+- A text field labelled **Server URL** with the backend's base URL; the app adds
+  `api/raw` (5) and `api/label` (5.1) to it.
+- Pre-filled with a test URL: `http://100.72.8.35:3000`.
 - The value is saved on the device and kept across app restarts.
 - The URL must be valid `http://` or `https://`; an invalid URL is rejected and recording can't start.
 - The field can't be edited while recording is on.
@@ -167,8 +184,19 @@ A single screen.
 While recording is on, the screen shows:
 
 - **Sent packets:** number of packets sent successfully since recording was switched on.
+- **Last packet sent:** seconds since the last successful upload.
+- **Last packet upload time:** how long that upload took, request to response, in ms.
 - **Location:** current latitude and longitude, or "Waiting for GPS…" before the first fix.
-- **Accelerometer:** live `x`, `y`, `z` values in m/s².
+- **Last GPS fix:** seconds since the latest fix.
+- **Accelerometer:** live `x`, `y`, `z` values in m/s², and the measured sensor rate in Hz
+  (events over the last second).
+
+### 6.4 Manual labels
+
+- Two buttons, **Pothole** and **Bump**, below the recording toggle.
+- Pressing one sends a label (5.1) with the current time and location.
+- Enabled only while recording is on and a GPS fix is available.
+- A snackbar shows "Pothole labelled" / "Bump labelled", or "Could not send label" on failure.
 
 ## 7. Background recording
 
