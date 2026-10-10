@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="recording_channel_name">Recording</string>
+    <string name="recording_channel_description">Shown while sensor data is being recorded</string>
+    <string name="recording_notification_title">Recording</string>
+    <string name="recording_notification_sent_packets">Sent packets: %1$d</string>
+</resources>
