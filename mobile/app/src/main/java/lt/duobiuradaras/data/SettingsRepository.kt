@@ -31,7 +31,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
 
     companion object {
         /** Backend readings route on the host machine, as seen from the emulator. */
-        const val DEFAULT_ENDPOINT_URL = "http://10.0.2.2:3000/api/readings"
+        const val DEFAULT_ENDPOINT_URL = "http://100.72.8.35:3000/api/raw"
 
         private val KEY_ENDPOINT_URL = stringPreferencesKey("endpoint_url")
     }

@@ -145,9 +145,8 @@ A single screen.
 ### 6.1 Endpoint setting
 
 - A text field labelled **Raw data URL** with the full endpoint URL.
-- Pre-filled with a test URL: `http://10.0.2.2:3000/api/readings` (the backend's
-  readings route on the host machine, as seen from the Android emulator). On a
-  real phone, replace the host with the server's address.
+- Pre-filled with a test URL: `http://100.72.8.35:3000/api/raw` (the backend's
+  raw data route).
 - The value is saved on the device and kept across app restarts.
 - The URL must be valid `http://` or `https://`; an invalid URL is rejected and recording can't start.
 - The field can't be edited while recording is on.

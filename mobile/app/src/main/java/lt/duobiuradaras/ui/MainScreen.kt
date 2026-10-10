@@ -288,7 +288,7 @@ private fun MainScreenStoppedPreview() {
     DuobiuRadarasTheme {
         MainScreen(
             state = MainUiState(isLoaded = true, isUrlValid = true),
-            endpointUrlField = rememberTextFieldState("http://10.0.2.2:3000/api/readings"),
+            endpointUrlField = rememberTextFieldState("http://100.72.8.35:3000/api/raw"),
             snackbarHostState = remember { SnackbarHostState() },
             onToggleRecording = {},
         )
@@ -310,7 +310,7 @@ private fun MainScreenRecordingPreview() {
                     acceleration = Acceleration(x = 0.12f, y = -0.31f, z = 9.81f),
                 ),
             ),
-            endpointUrlField = rememberTextFieldState("http://10.0.2.2:3000/api/readings"),
+            endpointUrlField = rememberTextFieldState("http://100.72.8.35:3000/api/raw"),
             snackbarHostState = remember { SnackbarHostState() },
             onToggleRecording = {},
         )
