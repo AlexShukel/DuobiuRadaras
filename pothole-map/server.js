@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { getPotholes } from './mock/potholes.js';
 
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST ?? '0.0.0.0';
 const PUBLIC_DIR = fileURLToPath(new URL('./public/', import.meta.url));
 const POTHOLES_API_URL = process.env.POTHOLES_API_URL ?? 'http://100.72.8.35:3000/api/potholes';
 const USE_MOCK = process.env.USE_MOCK === '1';
@@ -87,7 +88,7 @@ const server = createServer(async (req, res) => {
   res.writeHead(405).end('Method not allowed');
 });
 
-server.listen(PORT, () => {
-  console.log(`Pothole map running at http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Pothole map running at http://${HOST}:${PORT}`);
   console.log(USE_MOCK ? 'Serving mock pothole data' : `Proxying potholes from ${POTHOLES_API_URL}`);
 });

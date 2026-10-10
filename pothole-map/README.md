@@ -19,6 +19,7 @@ Open http://localhost:3000.
 Environment variables:
 
 - `PORT` — port to listen on (default `3000`).
+- `HOST` — interface to bind to (default `0.0.0.0`, i.e. all interfaces; set `127.0.0.1` for local-only).
 - `POTHOLES_API_URL` — upstream detection server endpoint (default `http://100.72.8.35:3000/api/potholes`).
 - `USE_MOCK=1` — serve generated mock data from `mock/potholes.js` instead of calling the upstream.
 
