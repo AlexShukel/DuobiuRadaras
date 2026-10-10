@@ -9,6 +9,7 @@ const WINDOW_SIZE: usize = 20;
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
 const POTHOLES_PATH: &str = "./potholes.json";
 const RAW: &str = "./raw.json";
+const LABELS_PATH: &str = "./labels.json";
 const POTHOLE_GROUP_RADIUS_M: f64 = 10.0;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
@@ -66,16 +67,65 @@ async fn main() -> io::Result<()> {
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
     println!("[INFO] Data directory: {}", std::env::current_dir()?.display());
     println!("[INFO] Calibration file: {CALIBRATION_TABLE_PATH}; potholes file: {POTHOLES_PATH}");
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.map_err(|error| {
-        eprintln!("[ERROR] Cannot bind 0.0.0.0:3000: {error}");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
+    let address = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&address).await.map_err(|error| {
+        eprintln!("[ERROR] Cannot bind {address}: {error}");
         error
     })?;
     println!("[INFO] Listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await
 }
 
-async fn post_label() {
+static LABELS_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+async fn post_label(
+    Json(event): Json<LabeledEvent>,
+) -> Result<StatusCode, StatusCode> {
+    println!("[INFO] POST /api/label: timestamp={}, latitude={}, longitude={}, label={:?}",
+        event.timestamp, event.latitude, event.longitude, event.label);
+
+    if !event.latitude.is_finite()
+        || !event.longitude.is_finite()
+        || !(-90.0..=90.0).contains(&event.latitude)
+        || !(-180.0..=180.0).contains(&event.longitude)
+    {
+        eprintln!("[WARN] POST /api/label: invalid coordinates; status=400");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let _guard = LABELS_FILE_LOCK.lock().map_err(|error| {
+        eprintln!("[ERROR] POST /api/label: lock failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut events: Vec<LabeledEvent> = match fs::read_to_string(LABELS_PATH) {
+        Ok(json) => serde_json::from_str(&json).map_err(|error| {
+            eprintln!("[ERROR] POST /api/label: invalid JSON in {LABELS_PATH}: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            eprintln!("[ERROR] POST /api/label: cannot read {LABELS_PATH}: {error}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    events.push(event);
+
+    let json = serde_json::to_string_pretty(&events).map_err(|error| {
+        eprintln!("[ERROR] POST /api/label: serialization failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    fs::write(LABELS_PATH, json).map_err(|error| {
+        eprintln!("[ERROR] POST /api/label: cannot write {LABELS_PATH}: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    println!("[INFO] Appended labeled event; total_labels={}", events.len());
+
+    Ok(StatusCode::OK)
 }
 
 // Also logs requests rejected before a handler runs (for example, invalid JSON).
