@@ -5,7 +5,46 @@ body {
   font-family: system-ui, sans-serif;
 }
 
-#map {
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 0;
+  background: #f4f4f4;
+  border-bottom: 1px solid #ccc;
+}
+
+.tab {
+  padding: 6px 14px;
+  border: 1px solid #ccc;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: #e6e6e6;
+  font: inherit;
+  cursor: pointer;
+}
+
+.tab.active {
+  background: #fff;
+  font-weight: 600;
+  margin-bottom: -1px;
+}
+
+.panel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.panel[hidden] {
+  display: none;
+}
+
+.map {
   height: 100%;
 }
 
@@ -24,4 +63,49 @@ body {
 
 .status.error {
   color: #b00020;
+}
+
+.legend {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1000;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.dot {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid #333;
+}
+
+.dot.pothole {
+  background: #ff0000;
+  border-color: #b00000;
+}
+
+.dot.bump {
+  background: #a020f0;
+  border-color: #6a0dad;
+}
+
+.line {
+  display: inline-block;
+  width: 24px;
+  height: 4px;
+  border-radius: 2px;
 }

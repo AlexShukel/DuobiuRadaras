@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getPotholes } from './mock/potholes.js';
@@ -7,9 +7,16 @@ import { getPotholes } from './mock/potholes.js';
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST ?? '0.0.0.0';
 const PUBLIC_DIR = fileURLToPath(new URL('./public/', import.meta.url));
-const POTHOLES_API_URL = process.env.POTHOLES_API_URL ?? 'http://100.72.8.35:3000/api/potholes';
+const POTHOLES_API_URL = process.env.POTHOLES_API_URL ?? 'http://100.72.8.35:3001/api/potholes';
 const USE_MOCK = process.env.USE_MOCK === '1';
 const UPSTREAM_TIMEOUT_MS = 5000;
+// Training data collected by ../server: one folder per phone with raw.json (sensor chunks with
+// GPS) and labels.json (human-pressed pothole / bump events).
+const DEVICES_DIR = process.env.DEVICES_DIR ?? fileURLToPath(new URL('../server/devices/', import.meta.url));
+// A pause longer than this between consecutive chunks starts a new route segment (dropped
+// packets, app restarted, phone put away), so the map does not draw a straight line across the gap.
+const ROUTE_GAP_MS = 10_000;
+const SAMPLE_PERIOD_MS = 25;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -40,6 +47,104 @@ async function fetchPotholes() {
     lat: latitude,
     lng: longitude,
   }));
+}
+
+function isFix(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && !(lat === 0 && lng === 0);
+}
+
+// Turns a device's raw chunks into a list of polylines: consecutive identical GPS fixes are
+// collapsed (the phone reports a new fix about once a second while samples arrive at 40 Hz),
+// and a long pause between chunks starts a new polyline.
+function buildRoute(chunks) {
+  const segments = [];
+  let segment = [];
+  let prevEnd = null;
+
+  for (const chunk of chunks) {
+    const start = Date.parse(chunk.started_at);
+    const samples = Array.isArray(chunk.samples) ? chunk.samples : [];
+    if (prevEnd !== null && Number.isFinite(start) && start - prevEnd > ROUTE_GAP_MS && segment.length) {
+      segments.push(segment);
+      segment = [];
+    }
+    for (const { latitude, longitude } of samples) {
+      if (!isFix(latitude, longitude)) continue;
+      const last = segment[segment.length - 1];
+      if (last && last[0] === latitude && last[1] === longitude) continue;
+      segment.push([latitude, longitude]);
+    }
+    if (Number.isFinite(start)) {
+      prevEnd = start + samples.length * SAMPLE_PERIOD_MS;
+    }
+  }
+  if (segment.length) segments.push(segment);
+  // A lone fix cannot be drawn as a line.
+  return segments.filter((points) => points.length > 1);
+}
+
+async function readJsonArray(path) {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+async function mtimeOf(path) {
+  try {
+    return (await stat(path)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+async function loadDevice(ip) {
+  const dir = join(DEVICES_DIR, ip);
+  const [chunks, labels] = await Promise.all([
+    readJsonArray(join(dir, 'raw.json')),
+    readJsonArray(join(dir, 'labels.json')),
+  ]);
+  const starts = chunks.map((c) => Date.parse(c.started_at)).filter(Number.isFinite);
+  return {
+    ip,
+    chunks: chunks.length,
+    from: starts.length ? new Date(Math.min(...starts)).toISOString() : null,
+    to: starts.length ? new Date(Math.max(...starts)).toISOString() : null,
+    route: buildRoute(chunks),
+    labels: labels
+      .filter((l) => isFix(l.latitude, l.longitude))
+      .map(({ timestamp, latitude, longitude, label }) => ({ timestamp, lat: latitude, lng: longitude, label })),
+  };
+}
+
+// raw.json files are tens of megabytes, so the parsed dataset is cached per device and only
+// rebuilt when raw.json or labels.json changes on disk.
+const datasetCache = new Map();
+
+async function loadDataset() {
+  let entries;
+  try {
+    entries = await readdir(DEVICES_DIR, { withFileTypes: true });
+  } catch (err) {
+    if (err.code === 'ENOENT') return { devices: [] };
+    throw err;
+  }
+  const ips = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+
+  const devices = await Promise.all(ips.map(async (ip) => {
+    const dir = join(DEVICES_DIR, ip);
+    const version = `${await mtimeOf(join(dir, 'raw.json'))}:${await mtimeOf(join(dir, 'labels.json'))}`;
+    const cached = datasetCache.get(ip);
+    if (cached && cached.version === version) return cached.device;
+    const device = await loadDevice(ip);
+    datasetCache.set(ip, { version, device });
+    return device;
+  }));
+
+  return { devices: devices.filter((d) => d.chunks > 0 || d.labels.length > 0) };
 }
 
 async function serveStatic(pathname, res) {
@@ -80,6 +185,16 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/dataset') {
+    try {
+      sendJson(res, 200, await loadDataset());
+    } catch (err) {
+      console.error(`Failed to read training data from ${DEVICES_DIR}:`, err.message);
+      sendJson(res, 500, { error: 'Failed to read training data' });
+    }
+    return;
+  }
+
   if (req.method === 'GET') {
     await serveStatic(url.pathname, res);
     return;
@@ -91,4 +206,5 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`Pothole map running at http://${HOST}:${PORT}`);
   console.log(USE_MOCK ? 'Serving mock pothole data' : `Proxying potholes from ${POTHOLES_API_URL}`);
+  console.log(`Training data from ${DEVICES_DIR}`);
 });
