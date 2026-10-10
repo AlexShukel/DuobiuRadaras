@@ -1,19 +1,37 @@
 use core::f64;
-use std::{collections::VecDeque, fs, io, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs, io,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
-use axum::{Json, Router, http::StatusCode, routing::{get, post}};
-use serde::{Deserialize, Serialize};
-use axum::{extract::{Query, Request}, middleware::{self, Next}, response::{Html, Response}};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, Query, Request},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{Html, Response},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const WINDOW_SIZE: usize = 20;
-/// How many recent raw chunks (2 s each) the live view keeps in memory: 300 = 10 minutes.
+/// How many recent raw chunks (2 s each) the live view keeps in memory per device: 300 = 10 minutes.
 const LIVE_CHUNK_CAPACITY: usize = 300;
 const LIVE_LABEL_CAPACITY: usize = 500;
 const UI_HTML: &str = include_str!("ui.html");
-const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
+/// Every device gets its own folder here, named after its IP address:
+/// `devices/<ip>/raw.json`, `devices/<ip>/labels.json`, `devices/<ip>/calibration.json`.
+const DEVICES_DIR: &str = "./devices";
+const RAW_FILE: &str = "raw.json";
+const LABELS_FILE: &str = "labels.json";
+const CALIBRATION_FILE: &str = "calibration.json";
+/// Detected potholes are shared by all devices: the map shows one picture of the road.
 const POTHOLES_PATH: &str = "./potholes.json";
-const RAW: &str = "./raw.json";
-const LABELS_PATH: &str = "./labels.json";
+const LEGACY_FILES: [&str; 3] = ["./raw.json", "./labels.json", "./calibration.json"];
 const POTHOLE_GROUP_RADIUS_M: f64 = 10.0;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
@@ -34,7 +52,7 @@ struct Sample {
     y: f64,
     z: f64,
     latitude: f64,
-    longitude: f64   
+    longitude: f64
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -66,16 +84,27 @@ async fn main() -> io::Result<()> {
         .route("/api/health", get(get_health))
         .route("/api/raw", post(post_raw).get(get_raw_live))
         .route("/api/label", post(post_label))
+        .route("/api/devices", get(get_devices))
         .route("/", get(get_ui))
         .route("/live", get(get_ui))
         .layer(middleware::from_fn(log_request));
 
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
     println!("[INFO] Data directory: {}", std::env::current_dir()?.display());
-    println!("[INFO] Calibration file: {CALIBRATION_TABLE_PATH}; potholes file: {POTHOLES_PATH}");
-    match load_live_buffer_from_disk() {
-        Ok((chunks, labels)) => println!("[INFO] Live view preloaded {chunks} chunks and {labels} labels from disk"),
-        Err(error) => eprintln!("[WARN] Live view starts empty: {error}"),
+    println!("[INFO] Per-device files: {DEVICES_DIR}/<ip>/{{{RAW_FILE},{LABELS_FILE},{CALIBRATION_FILE}}}; shared potholes file: {POTHOLES_PATH}");
+    for legacy in LEGACY_FILES {
+        if Path::new(legacy).exists() {
+            eprintln!("[WARN] {legacy} is no longer used; data now lives in {DEVICES_DIR}/<ip>/");
+        }
+    }
+    match load_devices_from_disk() {
+        Ok(loaded) if loaded.is_empty() => println!("[INFO] No devices on disk yet; the first request from a new IP creates its folder"),
+        Ok(loaded) => {
+            for (ip, chunks, labels) in loaded {
+                println!("[INFO] Device {ip}: live view preloaded {chunks} chunks and {labels} labels from disk");
+            }
+        }
+        Err(error) => eprintln!("[WARN] Could not scan {DEVICES_DIR}: {error}"),
     }
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
     let address = format!("0.0.0.0:{port}");
@@ -84,15 +113,257 @@ async fn main() -> io::Result<()> {
         error
     })?;
     println!("[INFO] Listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await
+    // `with_connect_info` makes the peer address available to handlers; it is the device identifier.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
 }
 
-static LABELS_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// ---------------------------------------------------------------------------
+// Devices: one entry per client IP. Each device has its own folder on disk, its
+// own live buffer, and its own mutex, so requests from different phones are
+// processed in parallel and only requests from the same phone wait on each other.
+
+struct Device {
+    ip: String,
+    dir: PathBuf,
+    live: LiveBuffer,
+    /// Unix milliseconds of the last request from this device (or the newest data file after a restart).
+    last_seen_ms: u64,
+}
+
+type SharedDevice = Arc<Mutex<Device>>;
+
+static DEVICES: LazyLock<Mutex<HashMap<String, SharedDevice>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl Device {
+    fn new(ip: &str) -> Self {
+        Device {
+            ip: ip.to_owned(),
+            dir: Path::new(DEVICES_DIR).join(device_dir_name(ip)),
+            live: LiveBuffer::new(),
+            last_seen_ms: 0,
+        }
+    }
+
+    fn raw_path(&self) -> PathBuf { self.dir.join(RAW_FILE) }
+    fn labels_path(&self) -> PathBuf { self.dir.join(LABELS_FILE) }
+    fn calibration_path(&self) -> PathBuf { self.dir.join(CALIBRATION_FILE) }
+
+    fn touch(&mut self) {
+        self.last_seen_ms = now_ms();
+    }
+
+    /// Seed the live buffer from this device's raw.json / labels.json so the page shows history after a restart.
+    fn preload_live(&mut self) -> Result<(usize, usize), String> {
+        let raw_path = self.raw_path();
+        let labels_path = self.labels_path();
+        let chunks: Vec<SampleChunk> = read_json_array(&raw_path)
+            .map_err(|e| format!("{}: {e}", raw_path.display()))?;
+        let labels: Vec<LabeledEvent> = read_json_array(&labels_path)
+            .map_err(|e| format!("{}: {e}", labels_path.display()))?;
+
+        let skip = chunks.len().saturating_sub(LIVE_CHUNK_CAPACITY);
+        let mut n_chunks = 0;
+        for chunk in chunks.into_iter().skip(skip) {
+            self.live.push_chunk(chunk);
+            n_chunks += 1;
+        }
+        let skip = labels.len().saturating_sub(LIVE_LABEL_CAPACITY);
+        let mut n_labels = 0;
+        for label in labels.into_iter().skip(skip) {
+            self.live.push_label(label);
+            n_labels += 1;
+        }
+
+        self.last_seen_ms = [raw_path, labels_path]
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok()?.modified().ok())
+            .filter_map(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|age| age.as_millis() as u64)
+            .max()
+            .unwrap_or(0);
+        Ok((n_chunks, n_labels))
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// IPv6 addresses contain colons, which are not valid in file names everywhere.
+fn device_dir_name(ip: &str) -> String {
+    ip.replace(':', "_")
+}
+
+fn device_ip_from_dir_name(name: &str) -> String {
+    name.replace('_', ":")
+}
+
+/// IPv4 clients of a dual-stack socket show up as `::ffff:a.b.c.d`; report them as plain IPv4.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// The device identifier: the first `X-Forwarded-For` address when the server sits behind
+/// a proxy (or when a test deliberately sets it), otherwise the TCP peer address.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    canonical_ip(forwarded.unwrap_or(peer.ip())).to_string()
+}
+
+fn lock_or_500<'a, T>(mutex: &'a Mutex<T>, what: &str) -> Result<MutexGuard<'a, T>, StatusCode> {
+    mutex.lock().map_err(|error| {
+        eprintln!("[ERROR] {what} lock failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Find or register the device for an IP. Registration is cheap; folders are created on first write.
+fn device_for(ip: &str) -> Result<SharedDevice, StatusCode> {
+    let mut registry = lock_or_500(&DEVICES, "device registry")?;
+    Ok(registry
+        .entry(ip.to_owned())
+        .or_insert_with(|| {
+            println!("[INFO] New device: {ip} -> {DEVICES_DIR}/{}", device_dir_name(ip));
+            Arc::new(Mutex::new(Device::new(ip)))
+        })
+        .clone())
+}
+
+fn registered_device(ip: &str) -> Result<Option<SharedDevice>, StatusCode> {
+    Ok(lock_or_500(&DEVICES, "device registry")?.get(ip).cloned())
+}
+
+fn all_devices() -> Result<Vec<SharedDevice>, StatusCode> {
+    Ok(lock_or_500(&DEVICES, "device registry")?.values().cloned().collect())
+}
+
+/// The device that talked to us most recently; what the live page shows when none is selected.
+fn most_recent_device() -> Result<Option<SharedDevice>, StatusCode> {
+    let mut best: Option<(u64, SharedDevice)> = None;
+    for device in all_devices()? {
+        let last_seen = lock_or_500(&device, "device")?.last_seen_ms;
+        if best.as_ref().is_none_or(|(seen, _)| last_seen > *seen) {
+            best = Some((last_seen, device.clone()));
+        }
+    }
+    Ok(best.map(|(_, device)| device))
+}
+
+/// Scan `devices/*/` on startup and preload each live buffer.
+fn load_devices_from_disk() -> Result<Vec<(String, usize, usize)>, String> {
+    let entries = match fs::read_dir(DEVICES_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut loaded = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let ip = device_ip_from_dir_name(&entry.file_name().to_string_lossy());
+        let device = device_for(&ip).map_err(|_| "device registry lock failed".to_owned())?;
+        let mut device = device.lock().map_err(|e| format!("device lock: {e}"))?;
+        match device.preload_live() {
+            Ok((chunks, labels)) => loaded.push((ip, chunks, labels)),
+            Err(error) => eprintln!("[WARN] Device {ip}: live view starts empty: {error}"),
+        }
+    }
+    loaded.sort();
+    Ok(loaded)
+}
+
+/// File work runs on the blocking pool so slow disks never stall the async workers
+/// that are serving other devices.
+async fn run_blocking<F, T>(task: F) -> Result<T, StatusCode>
+where
+    F: FnOnce() -> Result<T, StatusCode> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task).await.map_err(|error| {
+        eprintln!("[ERROR] blocking task failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+}
+
+fn read_json_array<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+    match fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str(&json).map_err(|error| format!("invalid JSON: {error}")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("cannot read: {error}")),
+    }
+}
+
+fn read_json_array_or_500<T: DeserializeOwned>(path: &Path, context: &str) -> Result<Vec<T>, StatusCode> {
+    read_json_array(path).map_err(|error| {
+        eprintln!("[ERROR] {context}: {}: {error}", path.display());
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+fn write_json_or_500<T: Serialize>(path: &Path, value: &T, pretty: bool, context: &str) -> Result<(), StatusCode> {
+    let json = if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) }
+        .map_err(|error| {
+            eprintln!("[ERROR] {context}: serialization failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            eprintln!("[ERROR] {context}: cannot create {}: {error}", parent.display());
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+    fs::write(path, json).map_err(|error| {
+        eprintln!("[ERROR] {context}: cannot write {}: {error}", path.display());
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceSummary {
+    device: String,
+    last_seen_ms: u64,
+    live_chunks: usize,
+    live_labels: usize,
+    calibrated: bool,
+}
+
+async fn get_devices() -> Result<Json<Vec<DeviceSummary>>, StatusCode> {
+    let mut summaries = Vec::new();
+    for device in all_devices()? {
+        let device = lock_or_500(&device, "device")?;
+        summaries.push(DeviceSummary {
+            device: device.ip.clone(),
+            last_seen_ms: device.last_seen_ms,
+            live_chunks: device.live.chunks.len(),
+            live_labels: device.live.labels.len(),
+            calibrated: device.calibration_path().exists(),
+        });
+    }
+    summaries.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms).then_with(|| a.device.cmp(&b.device)));
+    println!("[INFO] GET /api/devices: devices={}", summaries.len());
+    Ok(Json(summaries))
+}
 
 async fn post_label(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(event): Json<LabeledEvent>,
 ) -> Result<StatusCode, StatusCode> {
-    println!("[INFO] POST /api/label: timestamp={}, latitude={}, longitude={}, label={:?}",
+    let ip = client_ip(&headers, peer);
+    println!("[INFO] POST /api/label: device={ip}, timestamp={}, latitude={}, longitude={}, label={:?}",
         event.timestamp, event.latitude, event.longitude, event.label);
 
     if !event.latitude.is_finite()
@@ -104,51 +375,33 @@ async fn post_label(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let _guard = LABELS_FILE_LOCK.lock().map_err(|error| {
-        eprintln!("[ERROR] POST /api/label: lock failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let mut events: Vec<LabeledEvent> = match fs::read_to_string(LABELS_PATH) {
-        Ok(json) => serde_json::from_str(&json).map_err(|error| {
-            eprintln!("[ERROR] POST /api/label: invalid JSON in {LABELS_PATH}: {error}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            eprintln!("[ERROR] POST /api/label: cannot read {LABELS_PATH}: {error}");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    events.push(event);
-
-    let json = serde_json::to_string_pretty(&events).map_err(|error| {
-        eprintln!("[ERROR] POST /api/label: serialization failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    fs::write(LABELS_PATH, json).map_err(|error| {
-        eprintln!("[ERROR] POST /api/label: cannot write {LABELS_PATH}: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    println!("[INFO] Appended labeled event; total_labels={}", events.len());
-    if let Some(event) = events.last() {
-        push_live_label(event.clone());
-    }
-
-    Ok(StatusCode::OK)
+    let device = device_for(&ip)?;
+    run_blocking(move || {
+        let mut device = lock_or_500(&device, "device")?;
+        device.touch();
+        let path = device.labels_path();
+        let mut events: Vec<LabeledEvent> = read_json_array_or_500(&path, "POST /api/label")?;
+        events.push(event.clone());
+        write_json_or_500(&path, &events, true, "POST /api/label")?;
+        println!("[INFO] Device {}: appended labeled event; total_labels={}", device.ip, events.len());
+        device.live.push_label(event);
+        Ok(StatusCode::OK)
+    }).await
 }
 
 // Also logs requests rejected before a handler runs (for example, invalid JSON).
 async fn log_request(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let client = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| client_ip(request.headers(), *peer))
+        .unwrap_or_else(|| "unknown".to_owned());
     let started = Instant::now();
-    println!("[INFO] Request received: {method} {path}");
+    println!("[INFO] Request received: {method} {path} from {client}");
     let response = next.run(request).await;
-    println!("[INFO] Request finished: {method} {path}, status={}, elapsed_ms={}",
+    println!("[INFO] Request finished: {method} {path} from {client}, status={}, elapsed_ms={}",
         response.status().as_u16(), started.elapsed().as_millis());
     println!("=========================");
     response
@@ -160,55 +413,34 @@ async fn get_health() -> StatusCode {
     StatusCode::OK
 }
 
-static RAW_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 async fn post_raw(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(sample_chunk): Json<SampleChunk>,
 ) -> Result<StatusCode, StatusCode> {
-    let _guard = RAW_FILE_LOCK.lock().map_err(|error| {
-        eprintln!("[ERROR] POST /api/raw: lock failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let ip = client_ip(&headers, peer);
+    let device = device_for(&ip)?;
+    run_blocking(move || {
+        let mut device = lock_or_500(&device, "device")?;
+        device.touch();
+        let path = device.raw_path();
+        let mut chunks: Vec<SampleChunk> = read_json_array_or_500(&path, "POST /api/raw")?;
 
-    let mut chunks: Vec<SampleChunk> = match fs::read_to_string(RAW) {
-        Ok(json) => serde_json::from_str(&json).map_err(|error| {
-            eprintln!("[ERROR] POST /api/raw: invalid JSON in {RAW}: {error}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            eprintln!("[ERROR] POST /api/raw: cannot read {RAW}: {error}");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+        let sample_count = sample_chunk.samples.len();
+        let live_copy = sample_chunk.clone();
+        chunks.push(sample_chunk);
+        write_json_or_500(&path, &chunks, true, "POST /api/raw")?;
 
-    let sample_count = sample_chunk.samples.len();
-    let live_copy = sample_chunk.clone();
-    chunks.push(sample_chunk);
-
-    let json = serde_json::to_string_pretty(&chunks).map_err(|error| {
-        eprintln!("[ERROR] POST /api/raw: serialization failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    fs::write(RAW, json).map_err(|error| {
-        eprintln!("[ERROR] POST /api/raw: cannot write {RAW}: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    println!(
-        "[INFO] Appended {sample_count} raw samples; total_chunks={}",
-        chunks.len()
-    );
-    push_live_chunk(live_copy);
-
-    Ok(StatusCode::OK)
+        println!("[INFO] Device {}: appended {sample_count} raw samples; total_chunks={}", device.ip, chunks.len());
+        device.live.push_chunk(live_copy);
+        Ok(StatusCode::OK)
+    }).await
 }
 
 // ---------------------------------------------------------------------------
-// Live view: an in-memory ring buffer of recent chunks and labels, served to the
-// browser page at `/` which polls `GET /api/raw?after=<seq>` about once a second.
-// Chunks and labels share one sequence counter so a single cursor covers both.
+// Live view: a per-device in-memory ring buffer of recent chunks and labels, served to
+// the browser page at `/` which polls `GET /api/raw?device=<ip>&after=<seq>` about once
+// a second. Chunks and labels share one sequence counter so a single cursor covers both.
 
 #[derive(Debug, Serialize, Clone)]
 struct LiveChunk {
@@ -231,6 +463,10 @@ struct LiveBuffer {
 }
 
 impl LiveBuffer {
+    fn new() -> Self {
+        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new() }
+    }
+
     fn push_chunk(&mut self, chunk: SampleChunk) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -252,9 +488,10 @@ impl LiveBuffer {
     }
 
     /// Everything with a sequence number strictly greater than `after`.
-    fn since(&self, after: u64) -> LiveResponse {
+    fn since(&self, after: u64, device: Option<String>) -> LiveResponse {
         let first_new = |seq: u64| seq > after;
         LiveResponse {
+            device,
             next: self.next_seq.saturating_sub(1),
             chunks: self.chunks.iter().filter(|c| first_new(c.seq)).cloned().collect(),
             labels: self.labels.iter().filter(|l| first_new(l.seq)).cloned().collect(),
@@ -264,6 +501,8 @@ impl LiveBuffer {
 
 #[derive(Debug, Serialize)]
 struct LiveResponse {
+    /// IP of the device this data belongs to; null when no device has reported yet.
+    device: Option<String>,
     /// Pass this back as `?after=` to receive only newer items next time.
     next: u64,
     chunks: Vec<LiveChunk>,
@@ -274,64 +513,32 @@ struct LiveResponse {
 struct LiveQuery {
     /// Last sequence number the client has seen; omitted or 0 means "send the whole buffer".
     after: Option<u64>,
-}
-
-static LIVE_BUFFER: std::sync::Mutex<LiveBuffer> = std::sync::Mutex::new(LiveBuffer {
-    next_seq: 1,
-    chunks: VecDeque::new(),
-    labels: VecDeque::new(),
-});
-
-fn push_live_chunk(chunk: SampleChunk) {
-    match LIVE_BUFFER.lock() {
-        Ok(mut buffer) => { buffer.push_chunk(chunk); }
-        Err(error) => eprintln!("[ERROR] live buffer lock failed: {error}"),
-    }
-}
-
-fn push_live_label(event: LabeledEvent) {
-    match LIVE_BUFFER.lock() {
-        Ok(mut buffer) => { buffer.push_label(event); }
-        Err(error) => eprintln!("[ERROR] live buffer lock failed: {error}"),
-    }
-}
-
-/// Seed the buffer from raw.json / labels.json so the page shows history after a restart.
-fn load_live_buffer_from_disk() -> Result<(usize, usize), String> {
-    let chunks: Vec<SampleChunk> = match fs::read_to_string(RAW) {
-        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{RAW}: {e}"))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("{RAW}: {error}")),
-    };
-    let labels: Vec<LabeledEvent> = match fs::read_to_string(LABELS_PATH) {
-        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{LABELS_PATH}: {e}"))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("{LABELS_PATH}: {error}")),
-    };
-    let mut buffer = LIVE_BUFFER.lock().map_err(|e| format!("lock: {e}"))?;
-    let skip = chunks.len().saturating_sub(LIVE_CHUNK_CAPACITY);
-    let mut n_chunks = 0;
-    for chunk in chunks.into_iter().skip(skip) {
-        buffer.push_chunk(chunk);
-        n_chunks += 1;
-    }
-    let skip = labels.len().saturating_sub(LIVE_LABEL_CAPACITY);
-    let mut n_labels = 0;
-    for label in labels.into_iter().skip(skip) {
-        buffer.push_label(label);
-        n_labels += 1;
-    }
-    Ok((n_chunks, n_labels))
+    /// Device IP to follow; omitted means the device that reported most recently.
+    device: Option<String>,
 }
 
 async fn get_raw_live(Query(query): Query<LiveQuery>) -> Result<Json<LiveResponse>, StatusCode> {
-    let buffer = LIVE_BUFFER.lock().map_err(|error| {
-        eprintln!("[ERROR] GET /api/raw: lock failed: {error}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    let response = buffer.since(query.after.unwrap_or(0));
-    println!("[INFO] GET /api/raw: after={} -> chunks={} labels={} next={}",
-        query.after.unwrap_or(0), response.chunks.len(), response.labels.len(), response.next);
+    let after = query.after.unwrap_or(0);
+    let device = match query.device.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ip) => match registered_device(ip)? {
+            Some(device) => device,
+            None => {
+                eprintln!("[WARN] GET /api/raw: unknown device {ip}; status=404");
+                return Err(StatusCode::NOT_FOUND);
+            }
+        },
+        None => match most_recent_device()? {
+            Some(device) => device,
+            None => {
+                println!("[INFO] GET /api/raw: no devices yet");
+                return Ok(Json(LiveBuffer::new().since(after, None)));
+            }
+        },
+    };
+    let device = lock_or_500(&device, "device")?;
+    let response = device.live.since(after, Some(device.ip.clone()));
+    println!("[INFO] GET /api/raw: device={} after={after} -> chunks={} labels={} next={}",
+        device.ip, response.chunks.len(), response.labels.len(), response.next);
     Ok(Json(response))
 }
 
@@ -339,9 +546,14 @@ async fn get_ui() -> Html<&'static str> {
     Html(UI_HTML)
 }
 
-async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCode, StatusCode> {
+async fn post_readings(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(sample_chunk): Json<SampleChunk>,
+) -> Result<StatusCode, StatusCode> {
     let started = Instant::now();
-    println!("[INFO] POST /api/readings: chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
+    let ip = client_ip(&headers, peer);
+    println!("[INFO] POST /api/readings: device={ip}, chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
 
     let vertical_axis: Vec<f64> = sample_chunk
         .samples
@@ -357,49 +569,62 @@ async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCo
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let json = fs::read_to_string(CALIBRATION_TABLE_PATH)
-        .map_err(|error| {
-            eprintln!("[ERROR] POST /api/readings: cannot read {CALIBRATION_TABLE_PATH}: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let device = device_for(&ip)?;
+    run_blocking(move || {
+        let table = {
+            let mut device = lock_or_500(&device, "device")?;
+            device.touch();
+            read_calibration(&device.calibration_path(), "POST /api/readings")?
+        };
 
-    let table: CalibrationTable = serde_json::from_str(&json)
-        .map_err(|error| {
-            eprintln!("[ERROR] post_readings: parse calibration JSON: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        if table.thresholds.is_empty()
+            || table.thresholds.iter().any(|value| !value.is_finite() || *value < 0.0)
+        {
+            eprintln!("[ERROR] POST /api/readings: device {ip}: calibration thresholds are empty or invalid; status=500");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
 
-    if table.thresholds.is_empty()
-        || table.thresholds.iter().any(|value| !value.is_finite() || *value < 0.0)
-    {
-        eprintln!("[ERROR] POST /api/readings: calibration thresholds are empty or invalid; status=500");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
+        let threshold = table.thresholds
+            .iter()
+            .copied()
+            .reduce(f64::min)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let threshold = table.thresholds
-        .iter()
-        .copied()
-        .reduce(f64::min)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        println!("[INFO] Readings: device={ip}, threshold={threshold:.6}, calibration_entries={}, windows={}",
+            table.thresholds.len(), vertical_axis.len() - WINDOW_SIZE + 1);
+        let locations = detect_pothole_locations(&sample_chunk, threshold);
+        println!("[INFO] Readings: flagged_windows={}", locations.len());
 
-    println!("[INFO] Readings: threshold={threshold:.6}, calibration_entries={}, windows={}",
-        table.thresholds.len(), vertical_axis.len() - WINDOW_SIZE + 1);
-    let locations = detect_pothole_locations(&sample_chunk, threshold);
-    println!("[INFO] Readings: flagged_windows={}", locations.len());
+        if locations.iter().any(|location| {
+            !location.latitude.is_finite()
+                || !location.longitude.is_finite()
+                || !(-90.0..=90.0).contains(&location.latitude)
+                || !(-180.0..=180.0).contains(&location.longitude)
+        }) {
+            eprintln!("[WARN] POST /api/readings: detected location has invalid coordinates; status=400");
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
-    if locations.iter().any(|location| {
-        !location.latitude.is_finite()
-            || !location.longitude.is_finite()
-            || !(-90.0..=90.0).contains(&location.latitude)
-            || !(-180.0..=180.0).contains(&location.longitude)
-    }) {
-        eprintln!("[WARN] POST /api/readings: detected location has invalid coordinates; status=400");
-        return Err(StatusCode::BAD_REQUEST);
-    }
+        save_potholes(locations)?;
+        println!("[INFO] POST /api/readings complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
+        Ok(StatusCode::OK)
+    }).await
+}
 
-    save_potholes(locations)?;
-    println!("[INFO] POST /api/readings complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
-    Ok(StatusCode::OK)
+/// A device must calibrate before its readings can be classified; a missing file is an error, not an empty table.
+fn read_calibration(path: &Path, context: &str) -> Result<CalibrationTable, StatusCode> {
+    let json = fs::read_to_string(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            eprintln!("[ERROR] {context}: {} does not exist; POST /api/calibration from this device first; status=500", path.display());
+        } else {
+            eprintln!("[ERROR] {context}: cannot read {}: {error}; status=500", path.display());
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    serde_json::from_str(&json).map_err(|error| {
+        eprintln!("[ERROR] {context}: parse calibration JSON {}: {error}; status=500", path.display());
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn detect_pothole_locations(
@@ -437,10 +662,13 @@ fn detect_potholes(vertical_axis: &[f64], threshold: f64) -> Vec<usize> {
 }
 
 async fn post_calibration(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(sample_chunk): Json<SampleChunk>,
 ) -> Result<StatusCode, StatusCode> {
     let started = Instant::now();
-    println!("[INFO] POST /api/calibration: chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
+    let ip = client_ip(&headers, peer);
+    println!("[INFO] POST /api/calibration: device={ip}, chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
     let vertical_axis: Vec<f64> = sample_chunk.samples.iter().map(|sample| sample.z).collect();
 
     let threshold = calibration_threshold(&vertical_axis).ok_or_else(|| {
@@ -448,56 +676,33 @@ async fn post_calibration(
         StatusCode::BAD_REQUEST
     })?;
     println!("[INFO] Calibration: windows={}, maximum_window_stdev={threshold:.6}", vertical_axis.len() - WINDOW_SIZE + 1);
-    let mut thresholds = vec![threshold];
 
-    if fs::exists(CALIBRATION_TABLE_PATH).map_err(|error| {
-            eprintln!("[ERROR] POST /api/calibration: cannot check whether calibration file exists: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })? {
-        let json = fs::read_to_string(CALIBRATION_TABLE_PATH)
-            .map_err(|error| {
-            eprintln!("[ERROR] POST /api/calibration: cannot read calibration file: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let device = device_for(&ip)?;
+    run_blocking(move || {
+        let mut device = lock_or_500(&device, "device")?;
+        device.touch();
+        let path = device.calibration_path();
+        let mut thresholds = vec![threshold];
 
-        let calibration_table: CalibrationTable = serde_json::from_str(&json)
-            .map_err(|error| {
-            eprintln!("[ERROR] POST /api/calibration: cannot parse calibration JSON: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        if path.exists() {
+            thresholds.extend(read_calibration(&path, "POST /api/calibration")?.thresholds);
+        }
 
-        thresholds.extend(calibration_table.thresholds);
-    }
-
-    let calibration_table = CalibrationTable { thresholds };
-    println!("[INFO] Calibration: saving {} thresholds to {CALIBRATION_TABLE_PATH}", calibration_table.thresholds.len());
-
-    let json = serde_json::to_string(&calibration_table)
-        .map_err(|error| {
-            eprintln!("[ERROR] POST /api/calibration: cannot serialize calibration JSON: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    fs::write(CALIBRATION_TABLE_PATH, &json)
-        .map_err(|error| {
-            eprintln!("[ERROR] POST /api/calibration: cannot write {CALIBRATION_TABLE_PATH}: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    println!("[INFO] POST /api/calibration complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
-    Ok(StatusCode::OK)
+        let calibration_table = CalibrationTable { thresholds };
+        println!("[INFO] Calibration: device={}, saving {} thresholds to {}", device.ip, calibration_table.thresholds.len(), path.display());
+        write_json_or_500(&path, &calibration_table, false, "POST /api/calibration")?;
+        println!("[INFO] POST /api/calibration complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
+        Ok(StatusCode::OK)
+    }).await
 }
 
 async fn get_potholes() -> Result<Json<Vec<PotholeLocation>>, StatusCode> {
     let started = Instant::now();
     println!("[INFO] GET /api/potholes");
-    let _guard = POTHOLES_FILE_LOCK
-        .lock()
-        .map_err(|error| {
-            eprintln!("[ERROR] get_potholes: potholes file lock: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let potholes = read_potholes()?;
+    let potholes = run_blocking(|| {
+        let _guard = lock_or_500(&POTHOLES_FILE_LOCK, "potholes file")?;
+        read_potholes()
+    }).await?;
     println!("[INFO] GET /api/potholes complete: locations={}, status=200, elapsed_ms={}", potholes.len(), started.elapsed().as_millis());
     Ok(Json(potholes))
 }
@@ -531,7 +736,7 @@ fn calibration_threshold(vertical_axis: &[f64]) -> Option<f64> {
         .reduce(f64::max)
 }
 
-static POTHOLES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static POTHOLES_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn read_potholes() -> Result<Vec<PotholeLocation>, StatusCode> {
     match fs::read_to_string(POTHOLES_PATH) {
@@ -560,12 +765,7 @@ fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
     }
     let candidates = locations.len();
 
-    let _guard = POTHOLES_FILE_LOCK
-        .lock()
-        .map_err(|error| {
-            eprintln!("[ERROR] save_potholes: potholes file lock: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let _guard = lock_or_500(&POTHOLES_FILE_LOCK, "potholes file")?;
 
     let mut potholes = Vec::new();
 
@@ -585,17 +785,7 @@ fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
         }
     }
 
-    let json = serde_json::to_string_pretty(&potholes)
-        .map_err(|error| {
-            eprintln!("[ERROR] save_potholes: serialize or write potholes JSON: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    fs::write(POTHOLES_PATH, json)
-        .map_err(|error| {
-            eprintln!("[ERROR] save_potholes: serialize or write potholes JSON: {error}; status=500");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    write_json_or_500(Path::new(POTHOLES_PATH), &potholes, true, "save_potholes")?;
 
     println!("[INFO] Saved {POTHOLES_PATH}: new_locations={added}, skipped_nearby={}, removed_stored_duplicates={removed_duplicates}, total={}", candidates - added, potholes.len());
 
@@ -645,13 +835,65 @@ mod tests {
         }
     }
 
-    fn fresh_buffer() -> LiveBuffer {
-        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new() }
+    fn peer(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 51234)
+    }
+
+    #[test]
+    fn client_ip_uses_peer_address_without_proxy_header() {
+        assert_eq!(client_ip(&HeaderMap::new(), peer("192.168.1.20")), "192.168.1.20");
+    }
+
+    #[test]
+    fn client_ip_prefers_first_forwarded_address() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "10.0.0.7, 172.16.0.1".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer("127.0.0.1")), "10.0.0.7");
+    }
+
+    #[test]
+    fn client_ip_ignores_malformed_forwarded_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer("127.0.0.1")), "127.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_unmaps_ipv4_mapped_ipv6() {
+        assert_eq!(client_ip(&HeaderMap::new(), peer("::ffff:192.168.1.5")), "192.168.1.5");
+    }
+
+    #[test]
+    fn device_dir_name_round_trips_ipv6() {
+        let ip = "fe80::1";
+        let name = device_dir_name(ip);
+        assert!(!name.contains(':'));
+        assert_eq!(device_ip_from_dir_name(&name), ip);
+        assert_eq!(device_dir_name("10.0.0.1"), "10.0.0.1");
+    }
+
+    #[test]
+    fn device_files_live_under_its_own_folder() {
+        let device = Device::new("10.0.0.1");
+        assert_eq!(device.raw_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(RAW_FILE));
+        assert_eq!(device.labels_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(LABELS_FILE));
+        assert_eq!(device.calibration_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(CALIBRATION_FILE));
+    }
+
+    #[test]
+    fn same_ip_maps_to_the_same_device_and_different_ips_do_not() {
+        let a = device_for("203.0.113.1").unwrap();
+        let a_again = device_for("203.0.113.1").unwrap();
+        let b = device_for("203.0.113.2").unwrap();
+        assert!(Arc::ptr_eq(&a, &a_again));
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(registered_device("203.0.113.2").unwrap().map(|d| d.lock().unwrap().ip.clone()), Some("203.0.113.2".to_owned()));
+        assert!(registered_device("203.0.113.250").unwrap().is_none());
     }
 
     #[test]
     fn live_buffer_cursor_returns_only_newer_items() {
-        let mut buffer = fresh_buffer();
+        let mut buffer = LiveBuffer::new();
         let first = buffer.push_chunk(chunk("a"));
         let label_seq = buffer.push_label(LabeledEvent {
             timestamp: 1, latitude: 54.0, longitude: 25.0, label: EventLabel::Bump,
@@ -659,16 +901,17 @@ mod tests {
         let second = buffer.push_chunk(chunk("b"));
         assert_eq!((first, label_seq, second), (1, 2, 3));
 
-        let all = buffer.since(0);
+        let all = buffer.since(0, Some("10.0.0.1".to_owned()));
+        assert_eq!(all.device.as_deref(), Some("10.0.0.1"));
         assert_eq!(all.chunks.len(), 2);
         assert_eq!(all.labels.len(), 1);
         assert_eq!(all.next, 3);
 
-        let newer = buffer.since(all.next);
+        let newer = buffer.since(all.next, None);
         assert!(newer.chunks.is_empty() && newer.labels.is_empty());
         assert_eq!(newer.next, 3);
 
-        let after_first = buffer.since(first);
+        let after_first = buffer.since(first, None);
         assert_eq!(after_first.chunks.len(), 1);
         assert_eq!(after_first.chunks[0].chunk.started_at, "b");
         assert_eq!(after_first.labels.len(), 1);
@@ -676,13 +919,13 @@ mod tests {
 
     #[test]
     fn live_buffer_drops_oldest_chunks_beyond_capacity() {
-        let mut buffer = fresh_buffer();
+        let mut buffer = LiveBuffer::new();
         for i in 0..(LIVE_CHUNK_CAPACITY + 5) {
             buffer.push_chunk(chunk(&i.to_string()));
         }
         assert_eq!(buffer.chunks.len(), LIVE_CHUNK_CAPACITY);
         assert_eq!(buffer.chunks.front().unwrap().chunk.started_at, "5");
-        assert_eq!(buffer.since(0).next, (LIVE_CHUNK_CAPACITY + 5) as u64);
+        assert_eq!(buffer.since(0, None).next, (LIVE_CHUNK_CAPACITY + 5) as u64);
     }
 
     #[test]

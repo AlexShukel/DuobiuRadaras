@@ -8,7 +8,9 @@ __pycache__/
 *.egg-info/
 
 # collected data and backups (server writes these at runtime)
+server/devices/
 server/raw.json
 server/labels.json
 server/potholes.json
 server/backup/
+server/server.log

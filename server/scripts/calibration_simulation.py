@@ -20,21 +20,25 @@ def generate_chunk(amplitude, seed, started_at, latitude=54.6872, longitude=25.2
         samples.append(dict(x=rng.uniform(-0.03, 0.03), y=rng.uniform(-0.03, 0.03),
                             z=9.81 + rng.uniform(-0.02, 0.02) + impact,
                             latitude=latitude, longitude=longitude))
-    return dict(started_at=started_at, samples=samples)
+    return dict(started_at=str(started_at), samples=samples)
 
 def max_stdev(chunk):
     z = [s['z'] for s in chunk['samples']]
     return max(statistics.pstdev(z[i:i + WINDOW_SIZE]) for i in range(len(z) - WINDOW_SIZE + 1))
 
-def post_json(url, payload):
+def post_json(url, payload, device=None):
+    headers = {'Content-Type': 'application/json'}
+    if device:
+        headers['X-Forwarded-For'] = device  # the server keys data by client IP; this pretends to be another device
     request = urllib.request.Request(url, data=json.dumps(payload, allow_nan=False).encode(),
-                                     headers={'Content-Type': 'application/json'}, method='POST')
+                                     headers=headers, method='POST')
     with urllib.request.urlopen(request, timeout=15) as response:
         return response.status
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', default='http://127.0.0.1:3000')
+    parser.add_argument('--device', help='Pretend to be this device IP (sent as X-Forwarded-For)')
     parser.add_argument('--amplitudes', type=float, nargs='+', default=[1.5, 2.0, 2.5])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--dry-run', action='store_true', help='Print request JSON without sending it')
@@ -50,7 +54,7 @@ def main():
         if args.dry_run:
             print(json.dumps(chunk, allow_nan=False))
         else:
-            status = post_json(args.base_url.rstrip('/') + '/api/calibration', chunk)
+            status = post_json(args.base_url.rstrip('/') + '/api/calibration', chunk, args.device)
             print(f'Passage {i + 1}: HTTP {status}; maximum window stdev={maximum:.6f} m/s^2', file=sys.stderr)
     print(f'Minimum threshold for THESE passages: {min(thresholds):.6f} m/s^2', file=sys.stderr)
     print('The server appends to existing calibration; old values can lower its effective threshold.', file=sys.stderr)

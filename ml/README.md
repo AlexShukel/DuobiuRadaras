@@ -2,7 +2,8 @@
 
 A small PyTorch 1-D CNN (about 10k parameters) that classifies 1.6 s windows of phone
 accelerometer data as **none / pothole / bump**, trained on the data the server collects
-via `POST /api/raw` (`raw.json`) and `POST /api/label` (`labels.json`).
+via `POST /api/raw` (`raw.json`) and `POST /api/label` (`labels.json`); the server stores them per device
+under `server/devices/<ip>/`.
 
 ## Setup
 
@@ -20,11 +21,11 @@ pytest                                                               # ~5 s
 | Step | Command |
 |------|---------|
 | synthetic drive (for testing) | `python -m pothole_ml.synth --out-dir data/synth --minutes 10` |
-| build dataset | `python -m pothole_ml.dataset --raw ../server/raw.json --labels ../server/labels.json --out data/dataset.npz --dump-alignment data/alignment.csv` |
+| build dataset | `python -m pothole_ml.dataset --raw ../server/devices/<ip>/raw.json --labels ../server/devices/<ip>/labels.json --out data/dataset.npz --dump-alignment data/alignment.csv` |
 | train | `python -m pothole_ml.train --dataset data/dataset.npz --out artifacts` |
 | evaluate a saved model | `python -m pothole_ml.evaluate --dataset data/dataset.npz --split test` |
 | HTML report (split timeline, training curves, test run) | `python -m pothole_ml.plot --dataset data/dataset.npz --artifacts artifacts --out artifacts/report.html` |
-| predict on new data | `python -m pothole_ml.predict --input ../server/raw.json --output events.json` |
+| predict on new data | `python -m pothole_ml.predict --input ../server/devices/<ip>/raw.json --output events.json` |
 
 `--raw` and `--labels` can be repeated to merge several recording sessions.
 Every command accepts `-h`.

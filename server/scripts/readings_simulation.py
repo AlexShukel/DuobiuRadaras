@@ -19,17 +19,21 @@ def generate_chunk(number, mode, amplitude, rng, started_at, latitude, longitude
                             z=9.81 + rng.uniform(-0.02, 0.02) + impact,
                             latitude=latitude + number * 0.00005,
                             longitude=longitude + number * 0.00005))
-    return dict(started_at=started_at, samples=samples), has_impact
+    return dict(started_at=str(started_at), samples=samples), has_impact
 
-def post_json(url, payload):
+def post_json(url, payload, device=None):
+    headers = {'Content-Type': 'application/json'}
+    if device:
+        headers['X-Forwarded-For'] = device  # the server keys data by client IP; this pretends to be another device
     request = urllib.request.Request(url, data=json.dumps(payload, allow_nan=False).encode(),
-                                     headers={'Content-Type': 'application/json'}, method='POST')
+                                     headers=headers, method='POST')
     with urllib.request.urlopen(request, timeout=15) as response:
         return response.status
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', default='http://127.0.0.1:3000')
+    parser.add_argument('--device', help='Pretend to be this device IP (sent as X-Forwarded-For)')
     parser.add_argument('--chunks', type=int, default=20)
     parser.add_argument('--mode', choices=['smooth', 'impact', 'mixed'], default='mixed')
     parser.add_argument('--amplitude', type=float, default=3.0)
@@ -60,7 +64,7 @@ def main():
         if args.dry_run:
             print(json.dumps(chunk, allow_nan=False))
         else:
-            status = post_json(args.base_url.rstrip('/') + '/api/readings', chunk)
+            status = post_json(args.base_url.rstrip('/') + '/api/readings', chunk, args.device)
             print(f'Chunk {number + 1}: HTTP {status}; {"impact" if impact else "smooth"}; '
                   f'location=({chunk["samples"][0]["latitude"]:.6f}, {chunk["samples"][0]["longitude"]:.6f})', file=sys.stderr)
 
