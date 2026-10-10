@@ -1,8 +1,9 @@
 use core::f64;
-use std::{fs, io};
+use std::{fs, io, time::Instant};
 
 use axum::{Json, Router, http::StatusCode, routing::{get, post}};
 use serde::{Deserialize, Serialize};
+use axum::{extract::Request, middleware::{self, Next}, response::Response};
 
 const WINDOW_SIZE: usize = 20;
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
@@ -17,7 +18,7 @@ struct PotholeLocation {
 
 #[derive(Deserialize, Debug)]
 struct SampleChunk {
-    started_at: u64, // in milliseconds
+    started_at: String, // in milliseconds
     samples: Vec<Sample>
 }
 
@@ -40,14 +41,43 @@ async fn main() -> io::Result<()> {
     let app = Router::new()
         .route("/api/readings", post(post_readings))
         .route("/api/potholes", get(get_potholes))
-        .route("/api/calibration", post(post_calibration));
+        .route("/api/calibration", post(post_calibration))
+        .route("/api/health", get(get_health))
+        .layer(middleware::from_fn(log_request));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
+    println!("[INFO] Data directory: {}", std::env::current_dir()?.display());
+    println!("[INFO] Calibration file: {CALIBRATION_TABLE_PATH}; potholes file: {POTHOLES_PATH}");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.map_err(|error| {
+        eprintln!("[ERROR] Cannot bind 0.0.0.0:3000: {error}");
+        error
+    })?;
+    println!("[INFO] Listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await
 }
 
+// Also logs requests rejected before a handler runs (for example, invalid JSON).
+async fn log_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    println!("[INFO] Request received: {method} {path}");
+    let response = next.run(request).await;
+    println!("[INFO] Request finished: {method} {path}, status={}, elapsed_ms={}",
+        response.status().as_u16(), started.elapsed().as_millis());
+    println!("=========================");
+    response
+}
+
+async fn get_health() -> StatusCode {
+    println!("[INFO] GET /api/health: status=200");
+
+    StatusCode::OK
+}
+
 async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCode, StatusCode> {
-    println!("POST readings");
+    let started = Instant::now();
+    println!("[INFO] POST /api/readings: chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
 
     let vertical_axis: Vec<f64> = sample_chunk
         .samples
@@ -58,18 +88,27 @@ async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCo
     if vertical_axis.len() < WINDOW_SIZE
         || vertical_axis.iter().any(|value| !value.is_finite())
     {
+        eprintln!("[WARN] POST /api/readings rejected: samples={}, required={}, non_finite_z={}, status=400",
+            vertical_axis.len(), WINDOW_SIZE, vertical_axis.iter().filter(|value| !value.is_finite()).count());
         return Err(StatusCode::BAD_REQUEST);
     }
 
     let json = fs::read_to_string(CALIBRATION_TABLE_PATH)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] POST /api/readings: cannot read {CALIBRATION_TABLE_PATH}: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let table: CalibrationTable = serde_json::from_str(&json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] post_readings: parse calibration JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     if table.thresholds.is_empty()
         || table.thresholds.iter().any(|value| !value.is_finite() || *value < 0.0)
     {
+        eprintln!("[ERROR] POST /api/readings: calibration thresholds are empty or invalid; status=500");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -79,7 +118,10 @@ async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCo
         .reduce(f64::min)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    println!("[INFO] Readings: threshold={threshold:.6}, calibration_entries={}, windows={}",
+        table.thresholds.len(), vertical_axis.len() - WINDOW_SIZE + 1);
     let locations = detect_pothole_locations(&sample_chunk, threshold);
+    println!("[INFO] Readings: flagged_windows={}", locations.len());
 
     if locations.iter().any(|location| {
         !location.latitude.is_finite()
@@ -87,11 +129,12 @@ async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCo
             || !(-90.0..=90.0).contains(&location.latitude)
             || !(-180.0..=180.0).contains(&location.longitude)
     }) {
+        eprintln!("[WARN] POST /api/readings: detected location has invalid coordinates; status=400");
         return Err(StatusCode::BAD_REQUEST);
     }
 
     save_potholes(locations)?;
-
+    println!("[INFO] POST /api/readings complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
     Ok(StatusCode::OK)
 }
 
@@ -132,42 +175,67 @@ fn detect_potholes(vertical_axis: &[f64], threshold: f64) -> Vec<usize> {
 async fn post_calibration(
     Json(sample_chunk): Json<SampleChunk>,
 ) -> Result<StatusCode, StatusCode> {
+    let started = Instant::now();
+    println!("[INFO] POST /api/calibration: chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
     let vertical_axis: Vec<f64> = sample_chunk.samples.iter().map(|sample| sample.z).collect();
 
-    let threshold = calibration_threshold(&vertical_axis)
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    
+    let threshold = calibration_threshold(&vertical_axis).ok_or_else(|| {
+        eprintln!("[WARN] POST /api/calibration: insufficient samples or non-finite acceleration; status=400");
+        StatusCode::BAD_REQUEST
+    })?;
+    println!("[INFO] Calibration: windows={}, maximum_window_stdev={threshold:.6}", vertical_axis.len() - WINDOW_SIZE + 1);
     let mut thresholds = vec![threshold];
 
-    if fs::exists(CALIBRATION_TABLE_PATH).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    if fs::exists(CALIBRATION_TABLE_PATH).map_err(|error| {
+            eprintln!("[ERROR] POST /api/calibration: cannot check whether calibration file exists: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })? {
         let json = fs::read_to_string(CALIBRATION_TABLE_PATH)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|error| {
+            eprintln!("[ERROR] POST /api/calibration: cannot read calibration file: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         let calibration_table: CalibrationTable = serde_json::from_str(&json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|error| {
+            eprintln!("[ERROR] POST /api/calibration: cannot parse calibration JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         thresholds.extend(calibration_table.thresholds);
     }
 
-    let calibration_table = CalibrationTable { 
-        thresholds
-    };
+    let calibration_table = CalibrationTable { thresholds };
+    println!("[INFO] Calibration: saving {} thresholds to {CALIBRATION_TABLE_PATH}", calibration_table.thresholds.len());
 
     let json = serde_json::to_string(&calibration_table)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] POST /api/calibration: cannot serialize calibration JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     fs::write(CALIBRATION_TABLE_PATH, &json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
+        .map_err(|error| {
+            eprintln!("[ERROR] POST /api/calibration: cannot write {CALIBRATION_TABLE_PATH}: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    println!("[INFO] POST /api/calibration complete: status=200, elapsed_ms={}", started.elapsed().as_millis());
     Ok(StatusCode::OK)
 }
 
 async fn get_potholes() -> Result<Json<Vec<PotholeLocation>>, StatusCode> {
+    let started = Instant::now();
+    println!("[INFO] GET /api/potholes");
     let _guard = POTHOLES_FILE_LOCK
         .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] get_potholes: potholes file lock: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    Ok(Json(read_potholes()?))
+    let potholes = read_potholes()?;
+    println!("[INFO] GET /api/potholes complete: locations={}, status=200, elapsed_ms={}", potholes.len(), started.elapsed().as_millis());
+    Ok(Json(potholes))
 }
 
 fn average(readings: &[f64]) -> f64 {
@@ -204,31 +272,46 @@ static POTHOLES_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn read_potholes() -> Result<Vec<PotholeLocation>, StatusCode> {
     match fs::read_to_string(POTHOLES_PATH) {
         Ok(json) => serde_json::from_str(&json)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+            .map_err(|error| {
+            eprintln!("[ERROR] read_potholes: parse potholes JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }),
 
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            println!("[INFO] {POTHOLES_PATH} does not exist yet; returning an empty collection");
             Ok(Vec::new())
         }
 
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => {
+            eprintln!("[ERROR] Cannot read {POTHOLES_PATH}: {error}; status=500");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        },
     }
 }
 
 fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
     if locations.is_empty() {
+        println!("[INFO] No candidate locations to save");
         return Ok(());
     }
+    let candidates = locations.len();
 
     let _guard = POTHOLES_FILE_LOCK
         .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] save_potholes: potholes file lock: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let mut potholes = Vec::new();
 
     // Also remove nearby duplicates already stored in the file.
-    for location in read_potholes()? {
+    let stored = read_potholes()?;
+    let previous_count = stored.len();
+    for location in stored {
         add_unique_pothole(&mut potholes, location);
     }
+    let removed_duplicates = previous_count - potholes.len();
 
     let mut added = 0;
 
@@ -239,14 +322,18 @@ fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
     }
 
     let json = serde_json::to_string_pretty(&potholes)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] save_potholes: serialize or write potholes JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     fs::write(POTHOLES_PATH, json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            eprintln!("[ERROR] save_potholes: serialize or write potholes JSON: {error}; status=500");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    if added > 0 {
-        println!("Saved {added} new pothole locations");
-    }
+    println!("[INFO] Saved {POTHOLES_PATH}: new_locations={added}, skipped_nearby={}, removed_stored_duplicates={removed_duplicates}, total={}", candidates - added, potholes.len());
 
     Ok(())
 }
@@ -388,7 +475,7 @@ mod tests {
 
     fn sample_chunk_with_distinct_locations() -> SampleChunk {
         SampleChunk {
-            started_at: 0,
+            started_at: "0".to_owned(),
             samples: (0..60)
                 .map(|index| Sample {
                     x: 0.0,
