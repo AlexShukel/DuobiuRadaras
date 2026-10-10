@@ -77,12 +77,12 @@ footer a { color: var(--ink-2); }
   <label><input type="checkbox" id="chM"><i class="sw" style="background:var(--mag)"></i>|a|</label>
   <label>y scale <select id="yscale"><option value="auto" selected>auto</option><option value="20">±20 m/s²</option><option value="40">±40 m/s²</option></select></label>
   <button id="pause" type="button">Pause</button>
-  <span class="stat" style="margin-left:auto">labels: <i class="sw" style="background:var(--pothole);height:12px;width:3px"></i> pothole <i class="sw" style="background:var(--bump);height:12px;width:3px"></i> bump</span>
+  <span class="stat" style="margin-left:auto">labels: <i class="sw" style="background:var(--pothole);height:12px;width:3px"></i> pothole <i class="sw" style="background:var(--bump);height:12px;width:3px"></i> bump &nbsp; model: <i class="sw" style="border-left:3px dashed var(--pothole);height:12px;width:0"></i> pothole <i class="sw" style="border-left:3px dashed var(--bump);height:12px;width:0"></i> bump</span>
 </div>
 <main id="panels">
   <div id="empty">Waiting for the first device to POST /api/raw</div>
 </main>
-<footer>Each device (identified by its IP) gets its own chart. "+ pothole" / "+ bump" on a panel label that device right now (like the button in the phone app); keys: Q/A for the first device, W/S for the second, E/D for the third (top row = pothole, home row = bump). Hover a chart and press <b>1</b> (pothole) or <b>2</b> (bump) to place a label exactly at the cursor's moment. <b>Ctrl+Z</b> undoes the last label added from this page (on the hovered device, or anywhere when nothing is hovered); labels sent from a phone are never undone here. "on chart" plus a click marks an earlier moment instead. Both are saved to that device's labels.json like a label from the phone. Polls <a href="/api/devices">/api/devices</a> and <a href="/api/raw">/api/raw?device=&lt;ip&gt;</a> every second; keeps the last 6 hours per device in the browser and on the server, which writes everything to devices/&lt;ip&gt;/raw.json.</footer>
+<footer>Each device (identified by its IP) gets its own chart. "+ pothole" / "+ bump" on a panel label that device right now (like the button in the phone app); keys: Q/A for the first device, W/S for the second, E/D for the third (top row = pothole, home row = bump). Hover a chart and press <b>1</b> (pothole) or <b>2</b> (bump) to place a label exactly at the cursor's moment. <b>Ctrl+Z</b> undoes the last label added from this page (on the hovered device, or anywhere when nothing is hovered); labels sent from a phone are never undone here. "on chart" plus a click marks an earlier moment instead. Both are saved to that device's labels.json like a label from the phone. Dashed markers with a percentage are events the neural network found in chunks sent to <code>/api/detect</code> (stored in predictions.json, never in labels.json). Polls <a href="/api/devices">/api/devices</a> and <a href="/api/raw">/api/raw?device=&lt;ip&gt;</a> every second; keeps the last 6 hours per device in the browser and on the server, which writes everything to devices/&lt;ip&gt;/raw.json.</footer>
 <script>
 (function () {
   "use strict";
@@ -134,6 +134,7 @@ footer a { color: var(--ink-2); }
       this.device = device;
       this.T = []; this.X = []; this.Y = []; this.Z = []; this.M = []; this.LAT = []; this.LON = [];
       this.labels = [];            // {t, label}
+      this.predictions = [];       // {t, label, score} found by the neural network (POST /api/detect)
       this.cursor = 0; this.chunkCount = 0; this.lastChunkAt = 0; this.lastReceivedAt = 0;
       this.dirty = true; this.hover = null; this.calibrated = false;
 
@@ -143,7 +144,7 @@ footer a { color: var(--ink-2); }
         `<div class="strip"><h2></h2><span class="pill offline"><i></i><span class="st">connecting</span></span>` +
         `<span class="stat">last chunk <b class="age">–</b></span><span class="stat">chunks <b class="chunks">0</b></span>` +
         `<span class="stat">rate <b class="rate">–</b> Hz</span><span class="stat">position <b class="pos">–</b></span>` +
-        `<span class="stat">labels <b class="labels">0</b></span><span class="stat">calibration <b class="cal">–</b></span>` +
+        `<span class="stat">labels <b class="labels">0</b></span><span class="stat">model <b class="preds">0</b></span><span class="stat">calibration <b class="cal">–</b></span>` +
         `<span class="stat" style="margin-left:auto">label now <button type="button" class="add pothole">+ pothole</button> <button type="button" class="add bump">+ bump</button></span>` +
         `<label class="stat">on chart <select class="mode"><option value="">off</option><option value="pothole">pothole</option><option value="bump">bump</option></select></label>` +
         `<span class="note"></span></div>` +
@@ -190,6 +191,7 @@ footer a { color: var(--ink-2); }
       while (n < T.length && T[n] < limit) n++;
       if (n) { [this.T, this.X, this.Y, this.Z, this.M, this.LAT, this.LON].forEach((a) => a.splice(0, n)); }
       while (this.labels.length && this.labels[0].t < limit) this.labels.shift();
+      while (this.predictions.length && this.predictions[0].t < limit) this.predictions.shift();
     }
 
     async poll() {
@@ -200,11 +202,13 @@ footer a { color: var(--ink-2); }
       if (paused) return;
       body.chunks.forEach((c) => this.addChunk(c));
       body.labels.forEach((l) => this.labels.push({ t: l.timestamp, label: l.label }));
+      (body.predictions || []).forEach((p) => this.predictions.push({ t: p.timestamp, label: p.label, score: p.score }));
       (body.removed || []).forEach((r) => this.dropLabel(r.timestamp, r.label));
       this.labels.sort((a, b) => a.t - b.t);
+      this.predictions.sort((a, b) => a.t - b.t);
       this.cursor = body.next;
       this.trim();
-      if (body.chunks.length || body.labels.length) this.dirty = true;
+      if (body.chunks.length || body.labels.length || (body.predictions || []).length) this.dirty = true;
     }
 
     setStatus(serverOk) {
@@ -219,6 +223,7 @@ footer a { color: var(--ink-2); }
       this.q(".age").textContent = ageMs === null ? "–" : ageMs < 1000 ? "now" : `${(ageMs / 1000).toFixed(ageMs < 60000 ? 1 : 0)} s ago`;
       this.q(".chunks").textContent = this.chunkCount;
       this.q(".labels").textContent = this.labels.length;
+      this.q(".preds").textContent = this.predictions.length;
       this.q(".cal").textContent = this.calibrated ? "yes" : "none";
       const T = this.T, n = T.length;
       if (n > 40) {
@@ -293,6 +298,17 @@ footer a { color: var(--ink-2); }
         ctx.fillStyle = css("--ink-2"); ctx.textBaseline = "bottom";
         const fits = x + 4 + ctx.measureText(l.label).width <= W - PAD.r;   // flip the name left when it would run off the chart
         ctx.textAlign = fits ? "left" : "right"; ctx.fillText(l.label, fits ? x + 4 : x - 4, PAD.t - 2);
+      }
+
+      // model predictions: dashed, name and score at the bottom so they never collide with label names
+      for (const p of this.predictions) {
+        if (p.t < tStart || p.t > tEnd) continue;
+        const x = xOf(p.t); ctx.strokeStyle = css(p.label === "bump" ? "--bump" : "--pothole"); ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b + 4); ctx.stroke(); ctx.setLineDash([]);
+        const text = `${p.label} ${Math.round(p.score * 100)}%`;
+        ctx.fillStyle = css("--ink-2"); ctx.textBaseline = "top";
+        const fits = x + 4 + ctx.measureText(text).width <= W - PAD.r;
+        ctx.textAlign = fits ? "left" : "right"; ctx.fillText(text, fits ? x + 4 : x - 4, H - PAD.b + 2);
       }
 
       // series

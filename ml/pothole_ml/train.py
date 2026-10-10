@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from sklearn.metrics import f1_score
 from torch import nn
+from tqdm import tqdm
 
 from .config import PipelineConfig
 from .dataset import load_dataset
@@ -47,7 +48,14 @@ def augment(xb: torch.Tensor, rng: torch.Generator) -> torch.Tensor:
 def train(cfg: PipelineConfig, data: dict, out_dir: Path, epochs: int = 60, lr: float = 1e-3,
           weight_decay: float = 1e-4, batch_size: int = 64, patience: int = 10, seed: int = 0,
           device: str = "cpu", split_method: str = "group", val_frac: float = 0.15,
-          test_frac: float = 0.15, no_class_weights: bool = False, verbose: bool = True) -> dict:
+          test_frac: float = 0.15, no_class_weights: bool = False, verbose: bool = True,
+          progress: bool | None = None) -> dict:
+    """Train, tune the event threshold on the validation split, evaluate and save artifacts.
+
+    ``progress`` shows a per-epoch bar on stderr (default: when ``verbose``); each epoch's
+    numbers are printed above it when ``verbose``.
+    """
+    progress = verbose if progress is None else progress
     set_seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     ws = dataset_windows(data)
@@ -77,7 +85,8 @@ def train(cfg: PipelineConfig, data: dict, out_dir: Path, epochs: int = 60, lr: 
 
     history, best_f1, best_loss, best_state, best_epoch, bad = [], -1.0, float("inf"), None, 0, 0
     t0 = time.time()
-    for epoch in range(1, epochs + 1):
+    bar = tqdm(range(1, epochs + 1), unit="epoch", disable=not progress, leave=False, dynamic_ncols=True)
+    for epoch in bar:
         model.train()
         perm = torch.randperm(len(Xtr), generator=gen)
         total, n = 0.0, 0
@@ -104,9 +113,11 @@ def train(cfg: PipelineConfig, data: dict, out_dir: Path, epochs: int = 60, lr: 
         history.append({"epoch": epoch, "train_loss": round(train_loss, 4),
                         "val_loss": round(val_loss, 4), "val_macro_f1": round(val_f1, 4),
                         "lr": opt.param_groups[0]["lr"]})
+        bar.set_postfix(train_loss=f"{train_loss:.3f}", val_loss=f"{val_loss:.3f}",
+                        val_f1=f"{val_f1:.3f}", best=best_epoch, refresh=False)
         if verbose:
-            print(f"epoch {epoch:3d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-                  f"val_macro_f1={val_f1:.4f}")
+            bar.write(f"epoch {epoch:3d} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                      f"val_macro_f1={val_f1:.4f}")
         # improvement = better macro-F1, or equal macro-F1 with lower val loss
         if val_f1 > best_f1 or (val_f1 == best_f1 and val_loss < best_loss):
             best_f1, best_loss, best_epoch, bad = val_f1, val_loss, epoch, 0
@@ -115,8 +126,9 @@ def train(cfg: PipelineConfig, data: dict, out_dir: Path, epochs: int = 60, lr: 
             bad += 1
             if bad >= patience:
                 if verbose:
-                    print(f"early stopping at epoch {epoch} (best epoch {best_epoch})")
+                    bar.write(f"early stopping at epoch {epoch} (best epoch {best_epoch})")
                 break
+    bar.close()
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -170,6 +182,7 @@ def main(argv=None):
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
     ap.add_argument("--no-class-weights", action="store_true")
+    ap.add_argument("--no-progress", action="store_true", help="no per-epoch progress bar")
     args = ap.parse_args(argv)
 
     data = load_dataset(args.dataset)
@@ -179,7 +192,7 @@ def main(argv=None):
     train(cfg, data, args.out, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
           batch_size=args.batch_size, patience=args.patience, seed=args.seed, device=args.device,
           split_method=args.split, val_frac=args.val_frac, test_frac=args.test_frac,
-          no_class_weights=args.no_class_weights)
+          no_class_weights=args.no_class_weights, progress=not args.no_progress)
 
 
 if __name__ == "__main__":

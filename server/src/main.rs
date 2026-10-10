@@ -18,6 +18,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+mod detector;
+use detector::PredictedEvent;
+
 const WINDOW_SIZE: usize = 20;
 /// How many recent raw chunks (2 s each) the live view keeps in memory per device: 10800 = 6 hours.
 /// A chunk is about 3 KB in memory, so a full buffer is roughly 35 MB per device.
@@ -32,6 +35,8 @@ const DEVICES_DIR: &str = "./devices";
 const RAW_FILE: &str = "raw.json";
 const LABELS_FILE: &str = "labels.json";
 const CALIBRATION_FILE: &str = "calibration.json";
+/// Events the neural network found in chunks sent to `POST /api/detect`; never mixed into labels.json.
+const PREDICTIONS_FILE: &str = "predictions.json";
 /// Detected potholes are shared by all devices: the map shows one picture of the road.
 const POTHOLES_PATH: &str = "./potholes.json";
 const LEGACY_FILES: [&str; 3] = ["./raw.json", "./labels.json", "./calibration.json"];
@@ -88,13 +93,15 @@ async fn main() -> io::Result<()> {
         .route("/api/raw", post(post_raw).get(get_raw_live))
         .route("/api/label", post(post_label).delete(delete_label))
         .route("/api/devices", get(get_devices))
+        .route("/api/detect", post(post_detect))
+        .route("/api/predictions", get(get_predictions))
         .route("/", get(get_ui))
         .route("/live", get(get_ui))
         .layer(middleware::from_fn(log_request));
 
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
     println!("[INFO] Data directory: {}", std::env::current_dir()?.display());
-    println!("[INFO] Per-device files: {DEVICES_DIR}/<ip>/{{{RAW_FILE},{LABELS_FILE},{CALIBRATION_FILE}}}; shared potholes file: {POTHOLES_PATH}");
+    println!("[INFO] Per-device files: {DEVICES_DIR}/<ip>/{{{RAW_FILE},{LABELS_FILE},{CALIBRATION_FILE},{PREDICTIONS_FILE}}}; shared potholes file: {POTHOLES_PATH}");
     for legacy in LEGACY_FILES {
         if Path::new(legacy).exists() {
             eprintln!("[WARN] {legacy} is no longer used; data now lives in {DEVICES_DIR}/<ip>/");
@@ -103,12 +110,20 @@ async fn main() -> io::Result<()> {
     match load_devices_from_disk() {
         Ok(loaded) if loaded.is_empty() => println!("[INFO] No devices on disk yet; the first request from a new IP creates its folder"),
         Ok(loaded) => {
-            for (ip, chunks, labels) in loaded {
-                println!("[INFO] Device {ip}: live view preloaded {chunks} chunks and {labels} labels from disk");
+            for (ip, chunks, labels, predictions) in loaded {
+                println!("[INFO] Device {ip}: live view preloaded {chunks} chunks, {labels} labels and {predictions} predictions from disk");
             }
         }
         Err(error) => eprintln!("[WARN] Could not scan {DEVICES_DIR}: {error}"),
     }
+    // Warm up the neural-network worker in the background so the first POST /api/detect is fast;
+    // a failure here is only logged, the endpoint retries on every request.
+    tokio::spawn(async {
+        match detector::ensure_started().await {
+            Ok(info) => println!("[INFO] Detector: ready ({info})"),
+            Err(error) => eprintln!("[WARN] Detector unavailable: {error}; POST /api/detect will store data but not label it"),
+        }
+    });
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
     let address = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await.map_err(|error| {
@@ -134,6 +149,7 @@ struct Device {
     /// Elements in raw.json / labels.json, counted at preload and kept up to date by appends.
     chunks_on_disk: usize,
     labels_on_disk: usize,
+    predictions_on_disk: usize,
 }
 
 type SharedDevice = Arc<Mutex<Device>>;
@@ -150,27 +166,33 @@ impl Device {
             last_seen_ms: 0,
             chunks_on_disk: 0,
             labels_on_disk: 0,
+            predictions_on_disk: 0,
         }
     }
 
     fn raw_path(&self) -> PathBuf { self.dir.join(RAW_FILE) }
     fn labels_path(&self) -> PathBuf { self.dir.join(LABELS_FILE) }
     fn calibration_path(&self) -> PathBuf { self.dir.join(CALIBRATION_FILE) }
+    fn predictions_path(&self) -> PathBuf { self.dir.join(PREDICTIONS_FILE) }
 
     fn touch(&mut self) {
         self.last_seen_ms = now_ms();
     }
 
     /// Seed the live buffer from this device's raw.json / labels.json so the page shows history after a restart.
-    fn preload_live(&mut self) -> Result<(usize, usize), String> {
+    fn preload_live(&mut self) -> Result<(usize, usize, usize), String> {
         let raw_path = self.raw_path();
         let labels_path = self.labels_path();
+        let predictions_path = self.predictions_path();
         let chunks: Vec<SampleChunk> = read_json_array(&raw_path)
             .map_err(|e| format!("{}: {e}", raw_path.display()))?;
         let labels: Vec<LabeledEvent> = read_json_array(&labels_path)
             .map_err(|e| format!("{}: {e}", labels_path.display()))?;
+        let predictions: Vec<PredictedEvent> = read_json_array(&predictions_path)
+            .map_err(|e| format!("{}: {e}", predictions_path.display()))?;
         self.chunks_on_disk = chunks.len();
         self.labels_on_disk = labels.len();
+        self.predictions_on_disk = predictions.len();
 
         let skip = chunks.len().saturating_sub(LIVE_CHUNK_CAPACITY);
         let mut n_chunks = 0;
@@ -184,6 +206,12 @@ impl Device {
             self.live.push_label(label);
             n_labels += 1;
         }
+        let skip = predictions.len().saturating_sub(LIVE_LABEL_CAPACITY);
+        let mut n_predictions = 0;
+        for prediction in predictions.into_iter().skip(skip) {
+            self.live.push_prediction(prediction);
+            n_predictions += 1;
+        }
 
         self.last_seen_ms = [raw_path, labels_path]
             .iter()
@@ -192,7 +220,7 @@ impl Device {
             .map(|age| age.as_millis() as u64)
             .max()
             .unwrap_or(0);
-        Ok((n_chunks, n_labels))
+        Ok((n_chunks, n_labels, n_predictions))
     }
 }
 
@@ -271,7 +299,7 @@ fn most_recent_device() -> Result<Option<SharedDevice>, StatusCode> {
 }
 
 /// Scan `devices/*/` on startup and preload each live buffer.
-fn load_devices_from_disk() -> Result<Vec<(String, usize, usize)>, String> {
+fn load_devices_from_disk() -> Result<Vec<(String, usize, usize, usize)>, String> {
     let entries = match fs::read_dir(DEVICES_DIR) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -287,7 +315,7 @@ fn load_devices_from_disk() -> Result<Vec<(String, usize, usize)>, String> {
         let device = device_for(&ip).map_err(|_| "device registry lock failed".to_owned())?;
         let mut device = device.lock().map_err(|e| format!("device lock: {e}"))?;
         match device.preload_live() {
-            Ok((chunks, labels)) => loaded.push((ip, chunks, labels)),
+            Ok((chunks, labels, predictions)) => loaded.push((ip, chunks, labels, predictions)),
             Err(error) => eprintln!("[WARN] Device {ip}: live view starts empty: {error}"),
         }
     }
@@ -391,6 +419,7 @@ struct DeviceSummary {
     last_seen_ms: u64,
     live_chunks: usize,
     live_labels: usize,
+    live_predictions: usize,
     calibrated: bool,
 }
 
@@ -403,6 +432,7 @@ async fn get_devices() -> Result<Json<Vec<DeviceSummary>>, StatusCode> {
             last_seen_ms: device.last_seen_ms,
             live_chunks: device.live.chunks.len(),
             live_labels: device.live.labels.len(),
+            live_predictions: device.live.predictions.len(),
             calibrated: device.calibration_path().exists(),
         });
     }
@@ -535,20 +565,121 @@ async fn post_raw(
 ) -> Result<StatusCode, StatusCode> {
     let ip = client_ip(&headers, peer);
     let device = device_for(&ip)?;
+    run_blocking(move || store_chunk(&device, sample_chunk, "POST /api/raw")).await?;
+    Ok(StatusCode::OK)
+}
+
+/// Append a chunk to the device's raw.json and its live buffer. Shared by `/api/raw` and `/api/detect`.
+fn store_chunk(device: &SharedDevice, sample_chunk: SampleChunk, context: &str) -> Result<(), StatusCode> {
+    let mut device = lock_or_500(device, "device")?;
+    device.touch();
+    let path = device.raw_path();
+    let sample_count = sample_chunk.samples.len();
+    append_json_array_element(&path, &sample_chunk).map_err(|error| {
+        eprintln!("[ERROR] {context}: cannot append to {}: {error}", path.display());
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    device.chunks_on_disk += 1;
+    println!("[INFO] Device {}: appended {sample_count} raw samples; total_chunks={}", device.ip, device.chunks_on_disk);
+    device.live.push_chunk(sample_chunk);
+    Ok(())
+}
+
+/// What `POST /api/detect` answers: the events the model found in this chunk (and the tail of
+/// the previous ones), or `detector_error` when the chunk was stored but could not be scored.
+#[derive(Debug, Serialize)]
+struct DetectResponse {
+    device: String,
+    events: Vec<PredictedEvent>,
+    windows: usize,
+    detector_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detector_error: Option<String>,
+}
+
+/// `POST /api/detect`: same body as `/api/raw`. The chunk is stored exactly like `/api/raw`
+/// (so the drive is still usable for training), then scored by the neural network. Events go
+/// to the device's predictions.json and the live page; potholes also go to the shared pothole map.
+/// The chunk is saved even when the detector fails, so the status is 200 either way and the
+/// phone must not resend it; `detector_error` tells what went wrong.
+async fn post_detect(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(sample_chunk): Json<SampleChunk>,
+) -> Result<Json<DetectResponse>, StatusCode> {
+    let started = Instant::now();
+    let ip = client_ip(&headers, peer);
+    println!("[INFO] POST /api/detect: device={ip}, chunk_started_at={:?}, samples={}", sample_chunk.started_at, sample_chunk.samples.len());
+    let device = device_for(&ip)?;
+    let chunk_for_disk = sample_chunk.clone();
+    let device_for_disk = device.clone();
+    run_blocking(move || store_chunk(&device_for_disk, chunk_for_disk, "POST /api/detect")).await?;
+
+    let detection = match detector::detect(&ip, &sample_chunk).await {
+        Ok(detection) => detection,
+        Err(error) => {
+            eprintln!("[ERROR] POST /api/detect: device {ip}: chunk stored but not scored: {error}");
+            return Ok(Json(DetectResponse { device: ip, events: Vec::new(), windows: 0, detector_ms: 0, detector_error: Some(error) }));
+        }
+    };
+
+    let events = detection.events.clone();
+    let device_ip = ip.clone();
     run_blocking(move || {
         let mut device = lock_or_500(&device, "device")?;
-        device.touch();
-        let path = device.raw_path();
-        let sample_count = sample_chunk.samples.len();
-        append_json_array_element(&path, &sample_chunk).map_err(|error| {
-            eprintln!("[ERROR] POST /api/raw: cannot append to {}: {error}", path.display());
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-        device.chunks_on_disk += 1;
+        let path = device.predictions_path();
+        for event in &events {
+            append_json_array_element(&path, event).map_err(|error| {
+                eprintln!("[ERROR] POST /api/detect: cannot append to {}: {error}", path.display());
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            device.predictions_on_disk += 1;
+            println!("[INFO] Device {}: model found {:?} at {} (score={:.3}); total_predictions={}",
+                device.ip, event.label, event.timestamp, event.score, device.predictions_on_disk);
+            device.live.push_prediction(event.clone());
+        }
+        drop(device);
 
-        println!("[INFO] Device {}: appended {sample_count} raw samples; total_chunks={}", device.ip, device.chunks_on_disk);
-        device.live.push_chunk(sample_chunk);
-        Ok(StatusCode::OK)
+        let potholes: Vec<PotholeLocation> = events.iter()
+            .filter(|e| e.label == EventLabel::Pothole)
+            .filter(|e| (-90.0..=90.0).contains(&e.latitude) && (-180.0..=180.0).contains(&e.longitude))
+            .map(|e| PotholeLocation { latitude: e.latitude, longitude: e.longitude })
+            .collect();
+        if !potholes.is_empty() {
+            save_potholes(potholes)?;
+        }
+        Ok(())
+    }).await?;
+
+    println!("[INFO] POST /api/detect complete: device={device_ip}, windows={}, events={}, detector_ms={}, elapsed_ms={}",
+        detection.windows, detection.events.len(), detection.elapsed_ms, started.elapsed().as_millis());
+    Ok(Json(DetectResponse {
+        device: device_ip,
+        events: detection.events,
+        windows: detection.windows,
+        detector_ms: detection.elapsed_ms,
+        detector_error: None,
+    }))
+}
+
+/// `GET /api/predictions?device=<ip>`: everything the model has found for that device
+/// (its predictions.json); without `device`, the device that reported most recently.
+async fn get_predictions(Query(query): Query<LiveQuery>) -> Result<Json<Vec<PredictedEvent>>, StatusCode> {
+    let device = match query.device.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ip) => registered_device(ip)?.ok_or_else(|| {
+            eprintln!("[WARN] GET /api/predictions: unknown device {ip}; status=404");
+            StatusCode::NOT_FOUND
+        })?,
+        None => match most_recent_device()? {
+            Some(device) => device,
+            None => return Ok(Json(Vec::new())),
+        },
+    };
+    run_blocking(move || {
+        let device = lock_or_500(&device, "device")?;
+        let predictions = read_json_array_or_500(&device.predictions_path(), "GET /api/predictions")?;
+        println!("[INFO] GET /api/predictions: device={} predictions={}", device.ip, predictions.len());
+        Ok(Json(predictions))
     }).await
 }
 
@@ -572,6 +703,13 @@ struct LiveLabel {
 }
 
 #[derive(Debug, Serialize, Clone)]
+struct LivePrediction {
+    seq: u64,
+    #[serde(flatten)]
+    event: PredictedEvent,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct LiveRemoval {
     seq: u64,
     #[serde(flatten)]
@@ -582,13 +720,15 @@ struct LiveBuffer {
     next_seq: u64,
     chunks: VecDeque<LiveChunk>,
     labels: VecDeque<LiveLabel>,
+    /// Events found by the neural network (`POST /api/detect`), drawn apart from human labels.
+    predictions: VecDeque<LivePrediction>,
     /// Labels deleted after they were served, so a viewer that already drew the marker removes it.
     removed: VecDeque<LiveRemoval>,
 }
 
 impl LiveBuffer {
     fn new() -> Self {
-        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new(), removed: VecDeque::new() }
+        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new(), predictions: VecDeque::new(), removed: VecDeque::new() }
     }
 
     fn remove_label(&mut self, key: LabelKey) -> u64 {
@@ -622,6 +762,16 @@ impl LiveBuffer {
         seq
     }
 
+    fn push_prediction(&mut self, event: PredictedEvent) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.predictions.push_back(LivePrediction { seq, event });
+        while self.predictions.len() > LIVE_LABEL_CAPACITY {
+            self.predictions.pop_front();
+        }
+        seq
+    }
+
     /// Everything with a sequence number strictly greater than `after`.
     fn since(&self, after: u64, device: Option<String>) -> LiveResponse {
         let first_new = |seq: u64| seq > after;
@@ -630,6 +780,7 @@ impl LiveBuffer {
             next: self.next_seq.saturating_sub(1),
             chunks: self.chunks.iter().filter(|c| first_new(c.seq)).cloned().collect(),
             labels: self.labels.iter().filter(|l| first_new(l.seq)).cloned().collect(),
+            predictions: self.predictions.iter().filter(|p| first_new(p.seq)).cloned().collect(),
             removed: self.removed.iter().filter(|r| first_new(r.seq)).cloned().collect(),
         }
     }
@@ -643,6 +794,8 @@ struct LiveResponse {
     next: u64,
     chunks: Vec<LiveChunk>,
     labels: Vec<LiveLabel>,
+    /// Events the neural network found since `after`.
+    predictions: Vec<LivePrediction>,
     /// Labels deleted since `after`; drop their markers.
     removed: Vec<LiveRemoval>,
 }
@@ -675,8 +828,8 @@ async fn get_raw_live(Query(query): Query<LiveQuery>) -> Result<Json<LiveRespons
     };
     let device = lock_or_500(&device, "device")?;
     let response = device.live.since(after, Some(device.ip.clone()));
-    println!("[INFO] GET /api/raw: device={} after={after} -> chunks={} labels={} next={}",
-        device.ip, response.chunks.len(), response.labels.len(), response.next);
+    println!("[INFO] GET /api/raw: device={} after={after} -> chunks={} labels={} predictions={} next={}",
+        device.ip, response.chunks.len(), response.labels.len(), response.predictions.len(), response.next);
     Ok(Json(response))
 }
 
@@ -1025,6 +1178,7 @@ mod tests {
         let device = Device::new("10.0.0.1");
         assert_eq!(device.raw_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(RAW_FILE));
         assert_eq!(device.labels_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(LABELS_FILE));
+        assert_eq!(device.predictions_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(PREDICTIONS_FILE));
         assert_eq!(device.calibration_path(), Path::new(DEVICES_DIR).join("10.0.0.1").join(CALIBRATION_FILE));
     }
 
@@ -1063,6 +1217,32 @@ mod tests {
         assert_eq!(after_first.chunks.len(), 1);
         assert_eq!(after_first.chunks[0].chunk.started_at, "b");
         assert_eq!(after_first.labels.len(), 1);
+    }
+
+    #[test]
+    fn live_buffer_serves_model_predictions_apart_from_labels() {
+        let mut buffer = LiveBuffer::new();
+        buffer.push_chunk(chunk("a"));
+        let seq = buffer.push_prediction(PredictedEvent {
+            timestamp: 5, latitude: 54.0, longitude: 25.0, label: EventLabel::Pothole, score: 0.9,
+        });
+        let all = buffer.since(0, None);
+        assert_eq!(all.predictions.len(), 1);
+        assert!(all.labels.is_empty());
+        assert_eq!(all.predictions[0].event.score, 0.9);
+        assert!(buffer.since(seq, None).predictions.is_empty());
+        let json = serde_json::to_value(&all).unwrap();
+        assert_eq!(json["predictions"][0]["label"], "pothole");
+        assert_eq!(json["predictions"][0]["seq"], seq);
+    }
+
+    #[test]
+    fn predicted_event_parses_the_worker_reply() {
+        let event: PredictedEvent = serde_json::from_str(
+            r#"{"timestamp": 1791630049250, "iso": "2026-10-10T11:00:49.250Z", "latitude": 54.68, "longitude": 25.27, "label": "bump", "score": 0.95}"#,
+        ).unwrap();
+        assert_eq!(event.label, EventLabel::Bump);
+        assert_eq!(event.timestamp, 1791630049250);
     }
 
     fn temp_file(name: &str) -> PathBuf {

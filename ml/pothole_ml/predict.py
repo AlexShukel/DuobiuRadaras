@@ -17,8 +17,8 @@ import torch
 from torch import nn
 
 from .config import PipelineConfig
-from .dataset import (WindowSet, build_segments, chunks_from_json, impact_signal, ms_to_iso,
-                      window_features, windows_from_segments)
+from .dataset import (WindowSet, build_segments, chunks_from_json, features_for, impact_signal,
+                      ms_to_iso, windows_from_segments)
 from .model import load_model
 
 
@@ -102,7 +102,7 @@ def predict_json(data, model: nn.Module, cfg: PipelineConfig, stride: int | None
         print(f"[warn] {len(short)} segment(s) shorter than window_len={cfg.window_len} skipped",
               file=sys.stderr)
     ws = windows_from_segments(segments, [], cfg, stride)
-    X = window_features(ws.X_raw, cfg.scale) if len(ws) else np.zeros((0, 3, cfg.window_len), np.float32)
+    X = features_for(ws, cfg)
     probs = predict_probs(model, X)
     events = windows_to_events(probs, ws, {s.segment_id: s for s in segments}, cfg, threshold, nms_ms)
     out = {

@@ -47,7 +47,8 @@ class PotholeMLP(nn.Module):
         return self.net(x)
 
 
-def build_model(cfg: PipelineConfig, in_channels: int = 3) -> nn.Module:
+def build_model(cfg: PipelineConfig, in_channels: int | None = None) -> nn.Module:
+    in_channels = cfg.in_channels if in_channels is None else in_channels
     if cfg.arch == "cnn":
         return PotholeCNN(in_channels, cfg.n_classes, cfg.width, cfg.dropout)
     if cfg.arch == "mlp":
@@ -61,15 +62,17 @@ def count_parameters(model: nn.Module) -> int:
 
 def save_model(model: nn.Module, cfg: PipelineConfig, path: str | Path) -> None:
     torch.save({"state_dict": model.state_dict(), "arch": cfg.arch, "width": cfg.width,
-                "window_len": cfg.window_len, "n_classes": cfg.n_classes}, path)
+                "window_len": cfg.window_len, "n_classes": cfg.n_classes,
+                "in_channels": cfg.in_channels}, path)
 
 
 def load_model(path: str | Path, cfg: PipelineConfig) -> nn.Module:
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    for key in ("arch", "width", "window_len"):
-        if ckpt.get(key) != getattr(cfg, key):
+    for key in ("arch", "width", "window_len", "in_channels"):
+        expected = getattr(cfg, key)
+        if ckpt.get(key, 3 if key == "in_channels" else None) != expected:
             raise ValueError(f"checkpoint {key}={ckpt.get(key)!r} does not match config "
-                             f"{key}={getattr(cfg, key)!r}")
+                             f"{key}={expected!r}")
     model = build_model(cfg)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()

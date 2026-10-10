@@ -162,7 +162,7 @@ def format_report(name: str, r: dict) -> str:
 
 def dataset_windows(d: dict) -> WindowSet:
     return WindowSet(d["X_raw"], d["y"], d["t_center"], d["latlon"], d["group_id"],
-                     d["segment_id"], d["event_t_ms"])
+                     d["segment_id"], d["event_t_ms"], d.get("speed"))
 
 
 def main(argv=None):

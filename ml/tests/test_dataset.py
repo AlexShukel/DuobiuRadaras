@@ -135,3 +135,65 @@ def test_window_features_rotation_invariant():
 def test_parse_started_at_rejects_garbage(value):
     with pytest.raises(ValueError):
         parse_started_at(value)
+
+
+def test_concurrent_devices_stay_separate_sessions(tmp_path):
+    """Two phones recording at the same time in different cars: one --raw/--labels pair each.
+
+    Interleaved chunk starts must not fragment each other's segments, and a label pressed in
+    one car must only claim an impact from that car's data.
+    """
+    import json
+    from pothole_ml.dataset import load_sessions
+
+    start = 1_791_630_000_000
+    period, n = 25, 80
+    cfg = PipelineConfig()
+
+    def write(name, offset_ms, spike_chunk, spike_value):
+        chunks = []
+        for i in range(20):
+            acc = np.tile([0.0, 0.0, G], (n, 1)).astype(np.float32)
+            if i == spike_chunk:
+                acc[40, 2] += spike_value
+            chunks.append({"started_at": start + offset_ms + i * period * n,
+                           "samples": [{"x": float(a[0]), "y": float(a[1]), "z": float(a[2]),
+                                        "latitude": 54.0, "longitude": 25.0} for a in acc]})
+        raw = tmp_path / f"{name}_raw.json"
+        raw.write_text(json.dumps(chunks))
+        return raw
+
+    # car A: weak impact in chunk 5; car B: strong impact in chunk 5, 7 ms later than A's chunk
+    raw_a = write("a", 0, 5, 3.0)
+    raw_b = write("b", 7, 5, 30.0)
+    label_t = start + 5 * period * n + 40 * period + 400   # pressed 400 ms after the impact
+    lab_a = tmp_path / "a_labels.json"
+    lab_a.write_text(json.dumps([{"timestamp": label_t, "latitude": 54.0, "longitude": 25.0, "label": "pothole"}]))
+    lab_b = tmp_path / "b_labels.json"
+    lab_b.write_text(json.dumps([]))
+
+    chunks, labels, segments, events, stats = load_sessions([raw_a, raw_b], [lab_a, lab_b], cfg)
+    assert len(chunks) == 40 and len(labels) == 1
+    assert len(segments) == 2                       # one continuous segment per car
+    assert [s.segment_id for s in segments] == [0, 1]
+    assert stats.matched == 1 and len(events) == 1
+    assert events[0].segment_id == 0                # car A's label found car A's (weaker) impact
+    assert events[0].peak_value == pytest.approx(3.0, abs=0.5)
+
+
+def test_speed_series_from_gps_fixes():
+    from pothole_ml.dataset import speed_series, window_features
+    # 40 Hz, a new fix every 40 samples (1 s), moving 10 m north per second, then a glitch
+    t = 25 * np.arange(160, dtype=np.int64)
+    lat = np.repeat([54.0, 54.0 + 10 / 111_195, 54.0 + 20 / 111_195, 54.0 + 5.0], 40)
+    latlon = np.stack([lat, np.full(160, 25.0)], axis=1)
+    v = speed_series(latlon, t, max_mps=50.0)
+    assert v[:80] == pytest.approx(10.0, rel=0.01)       # 10 m/s between the first fixes
+    assert v[80:].max() == pytest.approx(50.0)           # glitch clipped
+    assert speed_series(latlon[:30], t[:30]).max() == 0  # single fix: unknown -> 0
+
+    w = np.tile([0.0, 0.0, G], (2, 64, 1)).astype(np.float32)
+    f = window_features(w, 1.0, speed=np.array([15.0, 0.0]), speed_scale=15.0)
+    assert f.shape == (2, 4, 64)
+    assert f[0, 3].max() == f[0, 3].min() == pytest.approx(1.0) and f[1, 3].max() == 0
+    assert window_features(w, 1.0).shape == (2, 3, 64)

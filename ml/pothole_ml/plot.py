@@ -172,20 +172,22 @@ def timeline_chart(ws, events, split_of_window, cfg: PipelineConfig) -> tuple[st
     y0, y1 = ax.t + 22, ax.h - ax.b - 2
     body = []
     minutes_by_split = {k: 0.0 for k in SPLIT_NAMES}
+    # A group is a block of absolute time (group_id * group_block_ms); several segments (two
+    # phones recording at once) can share one block, so draw one bar per segment in the block.
     for g in np.unique(ws.group_id):
         m = ws.group_id == g
-        seg = int(ws.segment_id[m][0])
-        block = int(g - seg * 1_000_000)
         sp = SPLIT_NAMES[int(split_of_window[m][0])]
-        lo = max(bounds[seg][0], bounds[seg][0] + block * cfg.group_block_ms)
-        hi = min(bounds[seg][1], bounds[seg][0] + (block + 1) * cfg.group_block_ms)
-        if hi <= lo:
-            continue
-        minutes_by_split[sp] += (hi - lo) / 60000
-        xa, xb = ax.x(xt(seg, lo)), ax.x(xt(seg, hi))
-        n_ev = int(((ws.event_t_ms[m] >= 0)).any())
-        body.append(f'<rect x="{xa:.1f}" y="{y0}" width="{max(xb - xa - 1, 1):.1f}" height="{y1 - y0}" fill="var(--{sp})">'
-                    f'<title>{sp} · segment {seg} block {block} · {int(m.sum())} windows</title></rect>')
+        for seg in np.unique(ws.segment_id[m]):
+            seg = int(seg)
+            ms = m & (ws.segment_id == seg)
+            lo = max(bounds[seg][0], float(ws.t_center[ms].min() - half), float(g * cfg.group_block_ms))
+            hi = min(bounds[seg][1], float(ws.t_center[ms].max() + half), float((g + 1) * cfg.group_block_ms))
+            if hi <= lo:
+                continue
+            minutes_by_split[sp] += (hi - lo) / 60000
+            xa, xb = ax.x(xt(seg, lo)), ax.x(xt(seg, hi))
+            body.append(f'<rect x="{xa:.1f}" y="{y0}" width="{max(xb - xa - 1, 1):.1f}" height="{y1 - y0}" fill="var(--{sp})">'
+                        f'<title>{sp} · segment {seg} block {int(g)} · {int(ms.sum())} windows</title></rect>')
     for t, cls, seg in events:
         name = cfg.class_names[int(cls)]
         body.append(ax.triangle(xt(int(seg), int(t)), y0 - 9, f"var(--{name})", up=(name == "bump"), size=4,

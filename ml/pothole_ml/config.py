@@ -32,10 +32,13 @@ class PipelineConfig:
     stride: int = 8                     # samples (200 ms)
     center_tol_ms: int = 300            # event within +/- this of window center -> positive
     ignore_margin_ms: int = 200         # event anywhere in window (+margin) but off-center -> ignore
-    group_block_ms: int = 20000         # windows are grouped per 20 s block for leak-free splits
+    group_block_ms: int = 20000         # windows are grouped per 20 s block (absolute time) for leak-free splits
 
     # --- features ---
     scale: float = 1.0                  # global amplitude divisor, estimated at build time
+    use_speed: bool = False             # add GPS-derived speed as a 4th (constant) input channel
+    speed_scale_mps: float = 15.0       # speed channel divisor (15 m/s = 54 km/h -> 1.0)
+    speed_max_mps: float = 50.0         # GPS glitches above this are clipped (180 km/h)
 
     # --- model ---
     arch: str = "cnn"                   # "cnn" | "mlp"
@@ -51,6 +54,10 @@ class PipelineConfig:
     @property
     def n_classes(self) -> int:
         return len(self.class_names)
+
+    @property
+    def in_channels(self) -> int:
+        return 3 + int(self.use_speed)
 
     @property
     def window_ms(self) -> int:

@@ -115,6 +115,13 @@ class WindowSet:
     group_id: np.ndarray    # (W,) int64
     segment_id: np.ndarray  # (W,) int64
     event_t_ms: np.ndarray  # (W,) int64, -1 if no event is associated
+    speed: np.ndarray = None  # (W,) float32 m/s from GPS, 0 when unknown
+
+    FIELDS = ("X_raw", "y", "t_center", "latlon", "group_id", "segment_id", "event_t_ms", "speed")
+
+    def __post_init__(self):
+        if self.speed is None:
+            self.speed = np.zeros(len(self.y), np.float32)
 
     def __len__(self) -> int:
         return len(self.y)
@@ -127,12 +134,10 @@ class WindowSet:
                 np.zeros((0, 0, 3), np.float32), np.zeros(0, np.int8), np.zeros(0, np.int64),
                 np.zeros((0, 2)), np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64),
             )
-        return WindowSet(*[np.concatenate([getattr(p, f) for p in parts]) for f in
-                           ("X_raw", "y", "t_center", "latlon", "group_id", "segment_id", "event_t_ms")])
+        return WindowSet(*[np.concatenate([getattr(p, f) for p in parts]) for f in WindowSet.FIELDS])
 
     def subset(self, idx: np.ndarray) -> "WindowSet":
-        return WindowSet(*[getattr(self, f)[idx] for f in
-                           ("X_raw", "y", "t_center", "latlon", "group_id", "segment_id", "event_t_ms")])
+        return WindowSet(*[getattr(self, f)[idx] for f in WindowSet.FIELDS])
 
 
 # ----------------------------------------------------------------------------- parsing
@@ -235,11 +240,42 @@ def impact_signal(acc: np.ndarray, median_window: int = 21) -> np.ndarray:
     return np.abs(mag - base)
 
 
-def window_features(windows: np.ndarray, scale: float = 1.0) -> np.ndarray:
-    """(W, L, 3) raw accelerometer -> (W, 3, L) orientation-invariant channels.
+def speed_series(latlon: np.ndarray, t_ms: np.ndarray, max_mps: float = 50.0) -> np.ndarray:
+    """Per-sample ground speed (m/s) from the GPS fixes carried by the samples.
+
+    Phones update the position about once a second, so consecutive samples share a fix.
+    The speed between two consecutive distinct fixes is assigned to every sample of that
+    interval; the last known speed is held to the end. Glitches are clipped to ``max_mps``.
+    Unknown (no second fix yet) is 0.
+    """
+    n = len(t_ms)
+    out = np.zeros(n, np.float32)
+    if n < 2:
+        return out
+    change = np.flatnonzero(np.any(np.diff(latlon, axis=0) != 0, axis=1)) + 1
+    fix_idx = np.concatenate([[0], change])
+    if len(fix_idx) < 2:
+        return out
+    lat = np.radians(latlon[fix_idx, 0])
+    lon = np.radians(latlon[fix_idx, 1])
+    earth_r = 6_371_000.0
+    north = np.diff(lat) * earth_r
+    east = np.diff(lon) * earth_r * np.cos((lat[1:] + lat[:-1]) / 2)
+    dt = np.diff(t_ms[fix_idx]) / 1000.0
+    v = np.clip(np.hypot(north, east) / np.maximum(dt, 1e-3), 0.0, max_mps)
+    for k in range(len(v)):
+        out[fix_idx[k]:fix_idx[k + 1]] = v[k]
+    out[fix_idx[-1]:] = v[-1]
+    return out
+
+
+def window_features(windows: np.ndarray, scale: float = 1.0,
+                    speed: np.ndarray | None = None, speed_scale: float = 15.0) -> np.ndarray:
+    """(W, L, 3) raw accelerometer -> (W, C, L) orientation-invariant channels.
 
     Channels: signed vertical component relative to the window's gravity estimate,
-    horizontal magnitude (mean-removed), and total magnitude minus gravity.
+    horizontal magnitude (mean-removed), and total magnitude minus gravity. With ``speed``
+    (W,) a fourth channel holds the window's speed / ``speed_scale``, constant along L.
     """
     w = windows.astype(np.float32)
     g = w.mean(axis=1, keepdims=True)                         # (W,1,3)
@@ -252,7 +288,19 @@ def window_features(windows: np.ndarray, scale: float = 1.0) -> np.ndarray:
     horiz = horiz - horiz.mean(axis=1, keepdims=True)
     mag = np.linalg.norm(w, axis=2) - g_norm[..., 0]
     feats = np.stack([vert, horiz, mag], axis=1) / float(scale)
+    if speed is not None:
+        s = np.broadcast_to((np.asarray(speed, np.float32) / float(speed_scale))[:, None, None],
+                            (len(w), 1, w.shape[1]))
+        feats = np.concatenate([feats, s], axis=1)
     return feats.astype(np.float32)
+
+
+def features_for(ws: "WindowSet", cfg: PipelineConfig) -> np.ndarray:
+    """Model input for a window set, honouring the config's feature switches."""
+    if len(ws) == 0:
+        return np.zeros((0, cfg.in_channels, cfg.window_len), np.float32)
+    return window_features(ws.X_raw, cfg.scale, ws.speed if cfg.use_speed else None,
+                           cfg.speed_scale_mps)
 
 
 def estimate_scale(windows: np.ndarray) -> float:
@@ -339,6 +387,7 @@ def make_windows(segment: Segment, events: list[Event], cfg: PipelineConfig,
     t_end = segment.t_ms[starts + L - 1]
     t_center = (t_start + t_end) // 2
     latlon = segment.latlon[starts + L // 2]
+    speed = np.median(speed_series(segment.latlon, segment.t_ms, cfg.speed_max_mps)[idx], axis=1).astype(np.float32)
 
     y = np.zeros(W, dtype=np.int8)
     event_t = np.full(W, -1, dtype=np.int64)
@@ -362,10 +411,11 @@ def make_windows(segment: Segment, events: list[Event], cfg: PipelineConfig,
         event_t[touched] = ev_t[nearest[touched]]
         anchor[touched] = ev_t[nearest[touched]]
 
-    block = (anchor - segment.start_ms) // cfg.group_block_ms
-    group_id = segment.segment_id * 1_000_000 + block
+    # Blocks of absolute time, shared by every session: two phones that drove the same road at
+    # the same time keep their windows of one moment in the same split (same pothole, same block).
+    group_id = anchor // cfg.group_block_ms
     seg_id = np.full(W, segment.segment_id, dtype=np.int64)
-    return WindowSet(X_raw.astype(np.float32), y, t_center, latlon, group_id, seg_id, event_t)
+    return WindowSet(X_raw.astype(np.float32), y, t_center, latlon, group_id, seg_id, event_t, speed)
 
 
 def windows_from_segments(segments: list[Segment], events: list[Event], cfg: PipelineConfig,
@@ -393,20 +443,61 @@ def subsample_negatives(ws: WindowSet, neg_ratio: float, cfg: PipelineConfig,
 
 # ----------------------------------------------------------------------------- build
 
+def load_sessions(raw_paths: list[Path], label_paths: list[Path], cfg: PipelineConfig
+                  ) -> tuple[list[Chunk], list[Label], list[Segment], list[Event], AlignmentStats]:
+    """Load recordings as independent sessions and align each session's labels to its own data.
+
+    When ``--raw`` and ``--labels`` are given the same number of times, the i-th pair is one
+    session (one device / one drive). Sessions are segmented separately, so two phones that
+    recorded at the same time in different cars never break each other's segments, and a label
+    pressed in one car can only claim an impact in that car's data. With unequal counts all
+    files are merged into one session (several sequential files of the same device).
+    """
+    if len(raw_paths) == len(label_paths):
+        pairs = list(zip(raw_paths, label_paths))
+    else:
+        print(f"[warn] {len(raw_paths)} raw files and {len(label_paths)} label files: merging "
+              "all into one session; pass one --labels per --raw to keep devices apart",
+              file=sys.stderr)
+        pairs = [(raw_paths, label_paths)]
+
+    all_chunks: list[Chunk] = []
+    all_labels: list[Label] = []
+    all_segments: list[Segment] = []
+    all_events: list[Event] = []
+    stats = AlignmentStats()
+    for raw, lab in pairs:
+        raw_list = raw if isinstance(raw, list) else [raw]
+        lab_list = lab if isinstance(lab, list) else [lab]
+        chunks = [c for p in raw_list for c in load_chunks(p)]
+        labels = [l for p in lab_list for l in load_labels(p)]
+        segments = build_segments(chunks, cfg.sample_period_ms, cfg.gap_tolerance_ms)
+        offset = len(all_segments)
+        for seg in segments:
+            seg.segment_id += offset
+        events, st = align_labels(labels, segments, cfg)
+        all_chunks += chunks
+        all_labels += labels
+        all_segments += segments
+        all_events += events
+        stats.matched += st.matched
+        stats.unmatched += st.unmatched
+        stats.offsets_ms += st.offsets_ms
+    all_events.sort(key=lambda e: e.t_ms)
+    return all_chunks, all_labels, all_segments, all_events, stats
+
+
 def build_dataset(raw_paths: list[Path], label_paths: list[Path], cfg: PipelineConfig,
                   out_path: Path, neg_ratio: float | None = None, seed: int = 0,
                   dump_alignment: Path | None = None, scale: float | None = None,
                   verbose: bool = True) -> tuple[WindowSet, PipelineConfig, dict]:
-    chunks = [c for p in raw_paths for c in load_chunks(p)]
-    labels = [l for p in label_paths for l in load_labels(p)]
-    segments = build_segments(chunks, cfg.sample_period_ms, cfg.gap_tolerance_ms)
-    events, stats = align_labels(labels, segments, cfg)
+    chunks, labels, segments, events, stats = load_sessions(raw_paths, label_paths, cfg)
     ws = windows_from_segments(segments, events, cfg)
     if neg_ratio is not None:
         ws = subsample_negatives(ws, neg_ratio, cfg, seed)
 
     cfg = cfg.apply_overrides(scale=scale if scale is not None else estimate_scale(ws.X_raw))
-    X = window_features(ws.X_raw, cfg.scale)
+    X = features_for(ws, cfg)
 
     total_min = sum(len(s) for s in segments) * cfg.sample_period_ms / 60000
     counts = {name: int((ws.y == i).sum()) for i, name in enumerate(cfg.class_names)}
@@ -414,7 +505,7 @@ def build_dataset(raw_paths: list[Path], label_paths: list[Path], cfg: PipelineC
     meta = {
         "config": cfg.to_dict(),
         "chunks": len(chunks), "segments": len(segments), "minutes": round(total_min, 2),
-        "labels": len(labels), "events": len(events),
+        "labels": len(labels), "events": len(events), "sessions": len(raw_paths),
         "alignment": {"matched": stats.matched, "unmatched": stats.unmatched,
                       "offsets_ms": stats.offsets_ms},
         "windows": counts,
@@ -424,7 +515,7 @@ def build_dataset(raw_paths: list[Path], label_paths: list[Path], cfg: PipelineC
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, X=X, X_raw=ws.X_raw, y=ws.y, t_center=ws.t_center,
                         latlon=ws.latlon, group_id=ws.group_id, segment_id=ws.segment_id,
-                        event_t_ms=ws.event_t_ms,
+                        event_t_ms=ws.event_t_ms, speed=ws.speed,
                         events=np.array([[e.t_ms, e.cls, e.segment_id] for e in events],
                                         dtype=np.int64).reshape(-1, 3))
     out_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -462,6 +553,8 @@ def main(argv=None):
     ap.add_argument("--dump-alignment", type=Path, help="write one CSV row per matched label")
     ap.add_argument("--scale", type=float, help="force the global amplitude scale")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--use-speed", action="store_true",
+                    help="add GPS-derived speed as a 4th input channel (saved in the config)")
     for name in ("stride", "window_len", "lookback_ms", "lookahead_ms", "label_offset_ms",
                  "fixed_offset_ms", "center_tol_ms", "gap_tolerance_ms"):
         ap.add_argument(f"--{name.replace('_', '-')}", type=int)
@@ -474,6 +567,7 @@ def main(argv=None):
         lookahead_ms=args.lookahead_ms, label_offset_ms=args.label_offset_ms,
         fixed_offset_ms=args.fixed_offset_ms, center_tol_ms=args.center_tol_ms,
         gap_tolerance_ms=args.gap_tolerance_ms, align_method=args.align_method,
+        use_speed=True if args.use_speed else None,
     )
     build_dataset(args.raw, args.labels, cfg, args.out, neg_ratio=args.neg_ratio, seed=args.seed,
                   dump_alignment=args.dump_alignment, scale=args.scale)
