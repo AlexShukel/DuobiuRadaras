@@ -37,6 +37,21 @@ struct CalibrationTable {
     thresholds: Vec<f64>
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct LabeledEvent {
+    timestamp: u64, // Unix timestamp in milliseconds
+    latitude: f64,
+    longitude: f64,
+    label: EventLabel,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum EventLabel {
+    Pothole,
+    Bump,
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let app = Router::new()
@@ -45,6 +60,7 @@ async fn main() -> io::Result<()> {
         .route("/api/calibration", post(post_calibration))
         .route("/api/health", get(get_health))
         .route("/api/raw", post(post_raw))
+        .route("/api/label", post(post_label))
         .layer(middleware::from_fn(log_request));
 
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
@@ -56,6 +72,10 @@ async fn main() -> io::Result<()> {
     })?;
     println!("[INFO] Listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await
+}
+
+async fn post_label() {
+
 }
 
 // Also logs requests rejected before a handler runs (for example, invalid JSON).
