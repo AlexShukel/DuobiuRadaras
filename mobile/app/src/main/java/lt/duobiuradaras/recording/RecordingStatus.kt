@@ -11,9 +11,14 @@ data class GeoPoint(val latitude: Double, val longitude: Double)
 /** Latest raw accelerometer reading, in m/s², device axes. */
 data class Acceleration(val x: Float, val y: Float, val z: Float)
 
+/** Where packets go: the normal endpoint or the calibration endpoint (SPEC.md 6.2). */
+enum class RecordingMode { NORMAL, CALIBRATION }
+
 data class RecordingState(
     val isRecording: Boolean = false,
-    /** Packets that got a 2xx response since recording was switched on. */
+    /** Endpoint packets currently go to; null when not recording. */
+    val mode: RecordingMode? = null,
+    /** Packets that got a 2xx response since recording was switched on, across both modes. */
     val sentPackets: Int = 0,
     /** Null until the first fix after recording was switched on. */
     val location: GeoPoint? = null,

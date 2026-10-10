@@ -3,18 +3,23 @@
 
     <!-- Endpoint setting (SPEC.md 6.1) -->
     <string name="endpoint_url_label">Endpoint URL</string>
+    <string name="calibration_url_label">Calibration URL</string>
     <string name="endpoint_url_invalid">Enter a full http:// or https:// URL</string>
-    <string name="endpoint_url_locked">Stop recording to change the URL</string>
+    <string name="endpoint_url_locked">Stop recording to change the URLs</string>
 
     <!-- Recording toggle (SPEC.md 6.2) -->
     <string name="recording_start">Start recording</string>
+    <string name="recording_start_calibration">Start calibration</string>
+    <string name="recording_switch_normal">Switch to normal</string>
+    <string name="recording_switch_calibration">Switch to calibration</string>
     <string name="recording_stop">Stop recording</string>
     <string name="location_permission_denied">Precise location permission is required to record</string>
 
     <!-- Live status (SPEC.md 6.3) -->
     <string name="status_placeholder">—</string>
     <string name="status_state">Recording</string>
-    <string name="status_state_on">On</string>
+    <string name="status_state_normal">Normal</string>
+    <string name="status_state_calibration">Calibration</string>
     <string name="status_state_off">Off</string>
     <string name="status_sent_packets">Sent packets</string>
     <string name="status_location">Location</string>

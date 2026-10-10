@@ -57,8 +57,8 @@ class PacketSender(
                 .connectTimeout(5, TimeUnit.SECONDS)
                 .writeTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)
-                // Keep a stuck upload from outliving the next packet by much.
-                .callTimeout(15, TimeUnit.SECONDS)
+                // Keep a stuck upload from piling up behind the next packets (one every 2 s).
+                .callTimeout(10, TimeUnit.SECONDS)
                 .build()
         }
     }

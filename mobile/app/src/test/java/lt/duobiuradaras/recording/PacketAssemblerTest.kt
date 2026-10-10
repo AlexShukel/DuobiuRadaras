@@ -12,10 +12,10 @@ class PacketAssemblerTest {
 
     private fun sample(i: Int) = Sample(x = i.toFloat(), y = 0f, z = 9.8f, latitude = 54.6872, longitude = 25.2797)
 
-    private fun timeOf(i: Int): Instant = start.plus(Duration.ofMillis(50L * i))
+    private fun timeOf(i: Int): Instant = start.plus(Duration.ofMillis(25L * i))
 
     @Test
-    fun emitsPacketEvery200Samples() {
+    fun emitsPacketEverySamplesPerPacket() {
         val assembler = PacketAssembler()
         val packets = mutableListOf<Packet>()
         for (i in 0 until 3 * SAMPLES_PER_PACKET + 17) {
@@ -36,10 +36,10 @@ class PacketAssemblerTest {
         }
 
         assertEquals("2026-10-09T17:44:00.123Z", packets[0].startedAt)
-        assertEquals((0 until 200).map { it.toFloat() }, packets[0].samples.map { it.x })
-        // SPEC.md 4.2: the next packet starts at 17:44:10.123Z.
-        assertEquals("2026-10-09T17:44:10.123Z", packets[1].startedAt)
-        assertEquals((200 until 400).map { it.toFloat() }, packets[1].samples.map { it.x })
+        assertEquals((0 until SAMPLES_PER_PACKET).map { it.toFloat() }, packets[0].samples.map { it.x })
+        // SPEC.md 4.2: the next packet starts at 17:44:02.123Z.
+        assertEquals("2026-10-09T17:44:02.123Z", packets[1].startedAt)
+        assertEquals((SAMPLES_PER_PACKET until 2 * SAMPLES_PER_PACKET).map { it.toFloat() }, packets[1].samples.map { it.x })
     }
 
     @Test
@@ -55,7 +55,7 @@ class PacketAssemblerTest {
     @Test
     fun resetDiscardsPartialPacket() {
         val assembler = PacketAssembler()
-        for (i in 0 until 150) {
+        for (i in 0 until SAMPLES_PER_PACKET - 1) {
             assertNull(assembler.add(sample(i), timeOf(i)))
         }
         assembler.reset()

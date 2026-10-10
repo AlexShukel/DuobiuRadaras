@@ -25,19 +25,34 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import lt.duobiuradaras.data.SettingsRepository
 import lt.duobiuradaras.data.isValidEndpointUrl
+import lt.duobiuradaras.recording.RecordingMode
 import lt.duobiuradaras.recording.RecordingService
 import lt.duobiuradaras.recording.RecordingState
 import lt.duobiuradaras.recording.RecordingStatus
 
+/** What a mode's button does when pressed (SPEC.md 6.2). */
+enum class ModeAction { START, SWITCH, STOP }
+
 data class MainUiState(
-    /** False until the saved endpoint URL has been loaded into the text field. */
+    /** False until the saved endpoint URLs have been loaded into the text fields. */
     val isLoaded: Boolean = false,
-    val isUrlValid: Boolean = false,
+    val validUrls: Set<RecordingMode> = emptySet(),
     val recording: RecordingState = RecordingState(),
 ) {
-    val isUrlEditable: Boolean get() = isLoaded && !recording.isRecording
-    val showUrlError: Boolean get() = isLoaded && !isUrlValid
-    val canStart: Boolean get() = isLoaded && isUrlValid
+    /** Both fields are locked while recording, since either may be switched to (SPEC.md 6.1). */
+    val areUrlsEditable: Boolean get() = isLoaded && !recording.isRecording
+
+    fun showUrlError(mode: RecordingMode): Boolean = isLoaded && mode !in validUrls
+
+    fun action(mode: RecordingMode): ModeAction = when {
+        !recording.isRecording -> ModeAction.START
+        recording.mode == mode -> ModeAction.STOP
+        else -> ModeAction.SWITCH
+    }
+
+    /** Stop is always allowed; starting or switching needs a valid URL for that mode. */
+    fun isButtonEnabled(mode: RecordingMode): Boolean =
+        action(mode) == ModeAction.STOP || (isLoaded && mode in validUrls)
 }
 
 class MainViewModel(
@@ -46,20 +61,22 @@ class MainViewModel(
 ) : AndroidViewModel(application) {
 
     /**
-     * Endpoint URL being edited. Owned here (not as a flow) so the text field
-     * is updated synchronously and the cursor never jumps.
+     * Endpoint URLs being edited, one per mode. Owned here (not as a flow) so the text
+     * fields are updated synchronously and the cursor never jumps.
      */
-    val endpointUrlField = TextFieldState()
+    val urlFields: Map<RecordingMode, TextFieldState> =
+        RecordingMode.entries.associateWith { TextFieldState() }
 
-    // Snapshot state, like the field, so both are observed in one consistent snapshot.
+    // Snapshot state, like the fields, so all are observed in one consistent snapshot.
     private var isLoaded by mutableStateOf(false)
-    private val endpointText = snapshotFlow { endpointUrlField.text.toString() }
 
     val uiState: StateFlow<MainUiState> = combine(
-        snapshotFlow { isLoaded to isValidEndpointUrl(endpointUrlField.text.toString()) },
+        snapshotFlow {
+            isLoaded to urlFields.filterValues { isValidEndpointUrl(it.text.toString()) }.keys
+        },
         RecordingStatus.state,
-    ) { (loaded, urlValid), recording ->
-        MainUiState(isLoaded = loaded, isUrlValid = urlValid, recording = recording)
+    ) { (loaded, validUrls), recording ->
+        MainUiState(isLoaded = loaded, validUrls = validUrls, recording = recording)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
@@ -68,35 +85,50 @@ class MainViewModel(
 
     init {
         viewModelScope.launch {
-            endpointUrlField.setTextAndPlaceCursorAtEnd(settings.endpointUrl.first())
+            for ((mode, field) in urlFields) {
+                field.setTextAndPlaceCursorAtEnd(settings.endpointUrl(mode).first())
+            }
             isLoaded = true
-            persistValidEdits()
+            for ((mode, field) in urlFields) {
+                launch { persistValidEdits(mode, field) }
+            }
         }
     }
 
     @OptIn(FlowPreview::class)
-    private suspend fun persistValidEdits() {
-        endpointText
+    private suspend fun persistValidEdits(mode: RecordingMode, field: TextFieldState) {
+        snapshotFlow { field.text.toString() }
             .drop(1) // the value just loaded from settings
             .debounce(500)
             .map { it.trim() }
             .filter(::isValidEndpointUrl)
-            .collect { settings.setEndpointUrl(it) }
+            .collect { settings.setEndpointUrl(mode, it) }
     }
 
-    /** Saves the URL and starts recording. Caller must already hold location permission. */
-    fun startRecording() {
-        val url = endpointUrlField.text.toString().trim()
-        if (!isLoaded || !isValidEndpointUrl(url)) return
-        if (url != endpointUrlField.text.toString()) {
-            endpointUrlField.setTextAndPlaceCursorAtEnd(url)
+    /**
+     * Handles a press of [mode]'s button: starts recording to its URL, switches the running
+     * recording to it, or stops if it is already the active mode. Starting requires the caller
+     * to already hold location permission.
+     */
+    fun onModeButton(mode: RecordingMode) {
+        val app = getApplication<Application>()
+        when (uiState.value.action(mode)) {
+            ModeAction.STOP -> RecordingService.stop(app)
+            ModeAction.SWITCH -> validUrl(mode)?.let { RecordingService.switchTo(app, mode, it) }
+            ModeAction.START -> validUrl(mode)?.let { url ->
+                viewModelScope.launch { settings.setEndpointUrl(mode, url) }
+                RecordingService.start(app, mode, url)
+            }
         }
-        viewModelScope.launch { settings.setEndpointUrl(url) }
-        RecordingService.start(getApplication<Application>(), url)
     }
 
-    fun stopRecording() {
-        RecordingService.stop(getApplication<Application>())
+    /** The trimmed URL for [mode], written back to its field, or null if it isn't valid. */
+    private fun validUrl(mode: RecordingMode): String? {
+        val field = urlFields.getValue(mode)
+        val url = field.text.toString().trim()
+        if (!isLoaded || !isValidEndpointUrl(url)) return null
+        if (url != field.text.toString()) field.setTextAndPlaceCursorAtEnd(url)
+        return url
     }
 
     companion object {

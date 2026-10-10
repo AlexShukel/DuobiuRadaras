@@ -7,7 +7,7 @@ import java.util.Locale
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
-/** One 50 ms sample (SPEC.md 4.1). */
+/** One 25 ms sample (SPEC.md 4.1). */
 @Serializable
 data class Sample(
     val x: Float,
@@ -17,7 +17,7 @@ data class Sample(
     val longitude: Double,
 )
 
-/** One upload: [SAMPLES_PER_PACKET] samples, 50 ms apart, starting at [startedAt] (SPEC.md 4). */
+/** One upload: [SAMPLES_PER_PACKET] samples, 25 ms apart, starting at [startedAt] (SPEC.md 4). */
 @Serializable
 data class Packet(
     @SerialName("started_at") val startedAt: String,

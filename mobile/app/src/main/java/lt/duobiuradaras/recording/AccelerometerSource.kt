@@ -32,11 +32,14 @@ class AccelerometerSource(context: Context) {
     fun start(): Boolean {
         val manager = sensorManager ?: return false
         val sensor = manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return false
-        // GAME is ~50 Hz, faster than the 20 Hz sampling grid.
-        return manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        // ~100 Hz, comfortably faster than the 40 Hz sampling grid
+        // (SENSOR_DELAY_GAME is only ~50 Hz). Below 200 Hz, so no extra permission is needed.
+        return manager.registerListener(listener, sensor, SENSOR_PERIOD_US)
     }
 
     fun stop() {
         sensorManager?.unregisterListener(listener)
     }
 }
+
+private const val SENSOR_PERIOD_US = 10_000

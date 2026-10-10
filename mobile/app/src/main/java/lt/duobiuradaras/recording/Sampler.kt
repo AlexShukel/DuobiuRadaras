@@ -9,10 +9,10 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 
 /** Sampling period (SPEC.md 3). */
-val SAMPLE_INTERVAL = 50.milliseconds
+val SAMPLE_INTERVAL = 25.milliseconds
 
 /**
- * Takes one sample per 50 ms tick from the latest [acceleration] and [location]
+ * Takes one sample per 25 ms tick from the latest [acceleration] and [location]
  * and feeds them into packets (SPEC.md 3.1, 3.2).
  */
 class Sampler(

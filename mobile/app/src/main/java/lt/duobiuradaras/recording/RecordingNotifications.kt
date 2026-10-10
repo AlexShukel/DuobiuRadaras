@@ -23,7 +23,7 @@ internal class RecordingNotifications(private val context: Context) {
         NotificationManagerCompat.from(context).createNotificationChannel(channel)
     }
 
-    fun build(sentPackets: Int): Notification {
+    fun build(mode: RecordingMode, sentPackets: Int): Notification {
         val openApp = PendingIntent.getActivity(
             context,
             0,
@@ -33,7 +33,14 @@ internal class RecordingNotifications(private val context: Context) {
         )
         return NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_recording_notification)
-            .setContentTitle(context.getString(R.string.recording_notification_title))
+            .setContentTitle(
+                context.getString(
+                    when (mode) {
+                        RecordingMode.NORMAL -> R.string.recording_notification_title_normal
+                        RecordingMode.CALIBRATION -> R.string.recording_notification_title_calibration
+                    },
+                ),
+            )
             .setContentText(context.getString(R.string.recording_notification_sent_packets, sentPackets))
             .setContentIntent(openApp)
             .setOngoing(true)
@@ -46,9 +53,9 @@ internal class RecordingNotifications(private val context: Context) {
     }
 
     /** Replaces the foreground notification. Silently ignored if notifications are denied. */
-    fun update(sentPackets: Int) {
+    fun update(mode: RecordingMode, sentPackets: Int) {
         context.getSystemService(NotificationManager::class.java)
-            ?.notify(NOTIFICATION_ID, build(sentPackets))
+            ?.notify(NOTIFICATION_ID, build(mode, sentPackets))
     }
 
     companion object {

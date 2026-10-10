@@ -2,8 +2,8 @@ package lt.duobiuradaras.recording
 
 import java.time.Instant
 
-/** 10 s of samples at 50 ms (SPEC.md 3). */
-const val SAMPLES_PER_PACKET = 200
+/** 2 s of samples at 25 ms (SPEC.md 3). */
+const val SAMPLES_PER_PACKET = 80
 
 /**
  * Groups samples into fixed-size packets. Not thread-safe: feed it from one coroutine.
