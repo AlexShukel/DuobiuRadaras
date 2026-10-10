@@ -2,7 +2,6 @@
 <resources>
     <string name="recording_channel_name">Recording</string>
     <string name="recording_channel_description">Shown while sensor data is being recorded</string>
-    <string name="recording_notification_title_normal">Recording</string>
-    <string name="recording_notification_title_calibration">Recording · calibration</string>
+    <string name="recording_notification_title">Recording raw data</string>
     <string name="recording_notification_sent_packets">Sent packets: %1$d</string>
 </resources>

@@ -132,8 +132,7 @@ next packet starts at `17:44:02.123Z`.
 - Body: the packet JSON above
 - Header: `Content-Type: application/json`
 - No authentication.
-- Endpoint URL: set by the user in the app (see 6.1), not hard-coded. There are two
-  URLs, normal and calibration; packets go to the one for the active mode (see 6.2).
+- Endpoint URL: set by the user in the app (see 6.1), not hard-coded.
 - One packet is sent every 2 seconds while recording is active.
 - **Success:** any `2xx` response. Each success increases the sent-packet counter (see 6.3).
 - **Failure:** a non-`2xx` response or a network error. The packet is dropped
@@ -141,43 +140,26 @@ next packet starts at `17:44:02.123Z`.
 
 ## 6. User interface
 
-A single screen with two modes, each with its own URL field and button:
+A single screen.
 
-| Mode            | Purpose                        | Default test URL                     |
-|-----------------|--------------------------------|--------------------------------------|
-| **Normal**      | Regular road data              | `http://10.0.2.2:8080/packets`       |
-| **Calibration** | Data for calibrating the backend | `http://10.0.2.2:8080/calibration` |
+### 6.1 Endpoint setting
 
-Packets have the same format (section 4) in both modes; only the URL differs.
+- A text field labelled **Raw data URL** with the full endpoint URL.
+- Pre-filled with a test URL: `http://10.0.2.2:3000/api/readings` (the backend's
+  readings route on the host machine, as seen from the Android emulator). On a
+  real phone, replace the host with the server's address.
+- The value is saved on the device and kept across app restarts.
+- The URL must be valid `http://` or `https://`; an invalid URL is rejected and recording can't start.
+- The field can't be edited while recording is on.
 
-### 6.1 Endpoint settings
+### 6.2 Recording toggle
 
-- One text field per mode with the full endpoint URL.
-- Pre-filled with the test URLs above (`10.0.2.2` is the host machine, as seen
-  from the Android emulator). These are placeholders and will be replaced with the
-  real server addresses later.
-- Both values are saved on the device and kept across app restarts.
-- A URL must be valid `http://` or `https://`; with an invalid URL, that mode's
-  button is disabled (it can't be started or switched to).
-- Neither field can be edited while recording is on.
-
-### 6.2 Mode buttons
-
-Exactly one mode is active while recording. Each mode's button does one of three things:
-
-| Recording state           | Button of active mode | Button of other mode   |
-|---------------------------|-----------------------|------------------------|
-| Off                       | Start (this mode)     | Start (that mode)      |
-| On                        | **Stop**              | **Switch** to it       |
-
-- **Start:** asks for location (and, on Android 13+, notification) permission if it
-  hasn't been granted yet, then starts the recording service in that mode. If
-  location permission is denied, recording stays off.
-- **Switch:** packets go to the other mode's URL from now on. Sampling continues
-  without interruption: the packet in progress is not discarded, it is sent to the
-  URL that is active when it completes. So the first packet after a switch can
-  contain up to 2 s of data recorded in the previous mode.
-- **Stop:** stops sampling. The packet in progress is discarded and not sent, so every
+- One button that switches recording **on** and **off**, and shows the current state
+  ("Record raw data" / "Stop recording").
+- **On:** asks for location (and, on Android 13+, notification) permission if it
+  hasn't been granted yet, then starts the recording service. If location
+  permission is denied, recording stays off.
+- **Off:** stops sampling. The packet in progress is discarded and not sent, so every
   packet the server receives has exactly 80 samples (a full 2 seconds).
 - Recording is off when the app starts.
 
@@ -185,9 +167,7 @@ Exactly one mode is active while recording. Each mode's button does one of three
 
 While recording is on, the screen shows:
 
-- **Mode:** Normal, Calibration, or Off.
-- **Sent packets:** number of packets sent successfully since recording was started,
-  counted across both modes (a switch doesn't reset it).
+- **Sent packets:** number of packets sent successfully since recording was switched on.
 - **Location:** current latitude and longitude, or "Waiting for GPS…" before the first fix.
 - **Accelerometer:** live `x`, `y`, `z` values in m/s².
 
@@ -197,8 +177,8 @@ While recording is on, the screen shows:
 - It runs in a **foreground service** of type `location`, started from the app
   while it is open. Because of this, the app only needs foreground location
   permission (`ACCESS_FINE_LOCATION`), not background location.
-- While the service runs, a persistent notification shows that recording is
-  active and in which mode. It displays the sent-packet count, and tapping it opens the app.
+- While the service runs, a persistent notification ("Recording raw data") shows that recording is
+  active. It displays the sent-packet count, and tapping it opens the app.
 - Recording stops only when the user switches it off in the app.
 
 ## 8. Open questions

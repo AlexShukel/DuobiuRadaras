@@ -16,7 +16,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -31,10 +31,6 @@ class RecordingService : LifecycleService() {
     private var session: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    /** Replaced on a mode switch; null when not recording. */
-    @Volatile
-    private var sender: PacketSender? = null
-
     override fun onCreate() {
         super.onCreate()
         notifications = RecordingNotifications(this)
@@ -43,12 +39,10 @@ class RecordingService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        val mode = intent?.getStringExtra(EXTRA_MODE)?.let(RecordingMode::valueOf)
-        val endpoint = intent?.getStringExtra(EXTRA_ENDPOINT)
-        when {
-            intent?.action == ACTION_START && mode != null -> startRecording(mode, endpoint)
-            intent?.action == ACTION_SWITCH && mode != null -> switchMode(mode, endpoint)
-            else -> stopRecording() // ACTION_STOP, or anything unexpected
+        if (intent != null && intent.action == ACTION_START) {
+            startRecording(intent.getStringExtra(EXTRA_ENDPOINT))
+        } else {
+            stopRecording() // ACTION_STOP, or anything unexpected
         }
         // A restart without the activity can't satisfy foreground-location rules.
         return START_NOT_STICKY
@@ -56,13 +50,13 @@ class RecordingService : LifecycleService() {
 
     override fun onDestroy() {
         stopSession()
-        RecordingStatus.update { it.copy(isRecording = false, mode = null) }
+        RecordingStatus.update { it.copy(isRecording = false) }
         super.onDestroy()
     }
 
-    private fun startRecording(mode: RecordingMode, endpointUrl: String?) {
+    private fun startRecording(endpointUrl: String?) {
         // Must happen promptly after startForegroundService(), before anything that can fail.
-        if (!enterForeground(mode)) {
+        if (!enterForeground()) {
             stopRecording()
             return
         }
@@ -75,7 +69,7 @@ class RecordingService : LifecycleService() {
             return
         }
 
-        RecordingStatus.update { RecordingState(isRecording = true, mode = mode) }
+        RecordingStatus.update { RecordingState(isRecording = true) }
 
         val accelerometer = AccelerometerSource(this).also { this.accelerometer = it }
         val location = LocationSource(this).also { this.location = it }
@@ -95,19 +89,16 @@ class RecordingService : LifecycleService() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
             .apply { acquire() }
 
-        sender = PacketSender(endpoint)
+        val sender = PacketSender(endpoint)
         val sampler = Sampler(accelerometer.latest, location.latest)
 
         session = lifecycleScope.launch {
             launch(Dispatchers.Default) {
                 sampler.run { packet ->
                     // Each upload runs on its own so a slow server never delays sampling.
-                    // Read when the packet completes, so it goes to the URL active at that moment.
-                    sender?.let { target ->
-                        launch {
-                            if (target.send(packet)) {
-                                RecordingStatus.update { it.copy(sentPackets = it.sentPackets + 1) }
-                            }
+                    launch {
+                        if (sender.send(packet)) {
+                            RecordingStatus.update { it.copy(sentPackets = it.sentPackets + 1) }
                         }
                     }
                 }
@@ -128,29 +119,15 @@ class RecordingService : LifecycleService() {
             }
             launch {
                 RecordingStatus.state
-                    .mapNotNull { state -> state.mode?.let { it to state.sentPackets } }
+                    .map { it.sentPackets }
                     .distinctUntilChanged()
-                    .collect { (mode, sentPackets) -> notifications.update(mode, sentPackets) }
+                    .collect { notifications.update(it) }
             }
         }
     }
 
-    /**
-     * Sends further packets, including the one in progress, to [endpointUrl] (SPEC.md 6.2).
-     * Sampling continues uninterrupted.
-     */
-    private fun switchMode(mode: RecordingMode, endpointUrl: String?) {
-        val endpoint = endpointUrl?.toHttpUrlOrNull()
-        if (session == null || endpoint == null) {
-            Log.e(TAG, "Ignoring switch to $mode: not recording or invalid URL $endpointUrl")
-            return
-        }
-        sender = PacketSender(endpoint)
-        RecordingStatus.update { it.copy(mode = mode) }
-    }
-
     /** Returns false if the system refused to start the foreground service. */
-    private fun enterForeground(mode: RecordingMode): Boolean {
+    private fun enterForeground(): Boolean {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         } else {
@@ -160,7 +137,7 @@ class RecordingService : LifecycleService() {
             ServiceCompat.startForeground(
                 this,
                 RecordingNotifications.NOTIFICATION_ID,
-                notifications.build(mode, sentPackets = 0),
+                notifications.build(sentPackets = 0),
                 type,
             )
             true
@@ -174,7 +151,7 @@ class RecordingService : LifecycleService() {
 
     private fun stopRecording() {
         stopSession()
-        RecordingStatus.update { it.copy(isRecording = false, mode = null) }
+        RecordingStatus.update { it.copy(isRecording = false) }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -183,7 +160,6 @@ class RecordingService : LifecycleService() {
     private fun stopSession() {
         session?.cancel()
         session = null
-        sender = null
         accelerometer?.stop()
         accelerometer = null
         location?.stop()
@@ -198,26 +174,16 @@ class RecordingService : LifecycleService() {
         private val UI_ACCELERATION_PERIOD = 100.milliseconds
 
         private const val ACTION_START = "lt.duobiuradaras.action.START"
-        private const val ACTION_SWITCH = "lt.duobiuradaras.action.SWITCH"
         private const val ACTION_STOP = "lt.duobiuradaras.action.STOP"
-        private const val EXTRA_MODE = "lt.duobiuradaras.extra.MODE"
         private const val EXTRA_ENDPOINT = "lt.duobiuradaras.extra.ENDPOINT"
 
         /** Starts recording. Caller must already hold location permission and pass a valid URL. */
-        fun start(context: Context, mode: RecordingMode, endpointUrl: String) {
-            ContextCompat.startForegroundService(context, intent(context, ACTION_START, mode, endpointUrl))
-        }
-
-        /** While recording, sends packets to [endpointUrl] from now on, without stopping sampling. */
-        fun switchTo(context: Context, mode: RecordingMode, endpointUrl: String) {
-            context.startService(intent(context, ACTION_SWITCH, mode, endpointUrl))
-        }
-
-        private fun intent(context: Context, action: String, mode: RecordingMode, endpointUrl: String) =
-            Intent(context, RecordingService::class.java)
-                .setAction(action)
-                .putExtra(EXTRA_MODE, mode.name)
+        fun start(context: Context, endpointUrl: String) {
+            val intent = Intent(context, RecordingService::class.java)
+                .setAction(ACTION_START)
                 .putExtra(EXTRA_ENDPOINT, endpointUrl)
+            ContextCompat.startForegroundService(context, intent)
+        }
 
         fun stop(context: Context) {
             context.startService(Intent(context, RecordingService::class.java).setAction(ACTION_STOP))

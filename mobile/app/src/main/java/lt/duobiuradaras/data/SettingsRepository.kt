@@ -12,42 +12,27 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.io.IOException
-import lt.duobiuradaras.recording.RecordingMode
 
 private val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
-/** Persistent user settings: one endpoint URL per [RecordingMode] (SPEC.md 6.1). */
+/** Persistent user settings (SPEC.md 6.1). */
 class SettingsRepository(private val dataStore: DataStore<Preferences>) {
 
     constructor(context: Context) : this(context.applicationContext.settingsDataStore)
 
-    fun endpointUrl(mode: RecordingMode): Flow<String> = dataStore.data
+    val endpointUrl: Flow<String> = dataStore.data
         .catch { e -> if (e is IOException) emit(emptyPreferences()) else throw e }
-        .map { prefs -> prefs[mode.key] ?: mode.defaultUrl }
+        .map { prefs -> prefs[KEY_ENDPOINT_URL] ?: DEFAULT_ENDPOINT_URL }
         .distinctUntilChanged()
 
-    suspend fun setEndpointUrl(mode: RecordingMode, url: String) {
-        dataStore.edit { prefs -> prefs[mode.key] = url }
+    suspend fun setEndpointUrl(url: String) {
+        dataStore.edit { prefs -> prefs[KEY_ENDPOINT_URL] = url }
     }
 
     companion object {
-        // Test server on the host machine, as seen from the emulator.
-        const val DEFAULT_ENDPOINT_URL = "http://10.0.2.2:8080/packets"
-        const val DEFAULT_CALIBRATION_URL = "http://10.0.2.2:8080/calibration"
+        /** Backend readings route on the host machine, as seen from the emulator. */
+        const val DEFAULT_ENDPOINT_URL = "http://10.0.2.2:3000/api/readings"
 
         private val KEY_ENDPOINT_URL = stringPreferencesKey("endpoint_url")
-        private val KEY_CALIBRATION_URL = stringPreferencesKey("calibration_url")
-
-        private val RecordingMode.key
-            get() = when (this) {
-                RecordingMode.NORMAL -> KEY_ENDPOINT_URL
-                RecordingMode.CALIBRATION -> KEY_CALIBRATION_URL
-            }
-
-        private val RecordingMode.defaultUrl
-            get() = when (this) {
-                RecordingMode.NORMAL -> DEFAULT_ENDPOINT_URL
-                RecordingMode.CALIBRATION -> DEFAULT_CALIBRATION_URL
-            }
     }
 }

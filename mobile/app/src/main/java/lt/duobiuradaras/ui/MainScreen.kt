@@ -35,11 +35,8 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -57,7 +54,6 @@ import kotlinx.coroutines.launch
 import lt.duobiuradaras.R
 import lt.duobiuradaras.recording.Acceleration
 import lt.duobiuradaras.recording.GeoPoint
-import lt.duobiuradaras.recording.RecordingMode
 import lt.duobiuradaras.recording.RecordingState
 import lt.duobiuradaras.ui.theme.DuobiuRadarasTheme
 
@@ -85,19 +81,15 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val locationDeniedMessage = stringResource(R.string.location_permission_denied)
-    // Mode whose Start button triggered the permission request; survives configuration changes.
-    var pendingStartMode by rememberSaveable { mutableStateOf<RecordingMode?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { results ->
-        val mode = pendingStartMode ?: return@rememberLauncherForActivityResult
-        pendingStartMode = null
         val fineGranted = results[Manifest.permission.ACCESS_FINE_LOCATION]
             ?: context.isGranted(Manifest.permission.ACCESS_FINE_LOCATION)
         // A denied notification permission only hides the notification; recording still works.
         if (fineGranted) {
-            viewModel.onModeButton(mode)
+            viewModel.startRecording()
         } else {
             scope.launch { snackbarHostState.showSnackbar(locationDeniedMessage) }
         }
@@ -105,15 +97,18 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
 
     MainScreen(
         state = state,
-        urlFields = viewModel.urlFields,
+        endpointUrlField = viewModel.endpointUrlField,
         snackbarHostState = snackbarHostState,
-        onModeButton = { mode ->
-            val missing = recordingPermissions().filterNot(context::isGranted)
-            if (state.action(mode) == ModeAction.START && missing.isNotEmpty()) {
-                pendingStartMode = mode
-                permissionLauncher.launch(missing.toTypedArray())
+        onToggleRecording = {
+            if (state.recording.isRecording) {
+                viewModel.stopRecording()
             } else {
-                viewModel.onModeButton(mode)
+                val missing = recordingPermissions().filterNot(context::isGranted)
+                if (missing.isEmpty()) {
+                    viewModel.startRecording()
+                } else {
+                    permissionLauncher.launch(missing.toTypedArray())
+                }
             }
         },
     )
@@ -122,9 +117,9 @@ fun MainRoute(viewModel: MainViewModel = viewModel(factory = MainViewModel.Facto
 @Composable
 fun MainScreen(
     state: MainUiState,
-    urlFields: Map<RecordingMode, TextFieldState>,
+    endpointUrlField: TextFieldState,
     snackbarHostState: SnackbarHostState,
-    onModeButton: (RecordingMode) -> Unit,
+    onToggleRecording: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(
@@ -145,66 +140,35 @@ fun MainScreen(
                 text = stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineMedium,
             )
-            for (mode in RecordingMode.entries) {
-                ModeSection(
-                    mode = mode,
-                    state = state,
-                    field = urlFields.getValue(mode),
-                    onClick = { onModeButton(mode) },
-                )
-            }
+            EndpointUrlField(state = state, field = endpointUrlField)
+            RecordingToggleButton(
+                isRecording = state.recording.isRecording,
+                enabled = state.recording.isRecording || state.canStart,
+                onClick = onToggleRecording,
+            )
             LiveStatusCard(recording = state.recording)
         }
     }
 }
 
-/** URL field plus its Start / Switch / Stop button, for one [RecordingMode] (SPEC.md 6.1, 6.2). */
 @Composable
-private fun ModeSection(
-    mode: RecordingMode,
-    state: MainUiState,
-    field: TextFieldState,
-    onClick: () -> Unit,
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        EndpointUrlField(mode = mode, state = state, field = field)
-        ModeButton(
-            mode = mode,
-            action = state.action(mode),
-            enabled = state.isButtonEnabled(mode),
-            onClick = onClick,
-        )
-    }
-}
-
-@Composable
-private fun EndpointUrlField(mode: RecordingMode, state: MainUiState, field: TextFieldState) {
-    val showError = state.showUrlError(mode)
+private fun EndpointUrlField(state: MainUiState, field: TextFieldState) {
     val supportingTextRes = when {
-        showError -> R.string.endpoint_url_invalid
+        state.showUrlError -> R.string.endpoint_url_invalid
         state.recording.isRecording -> R.string.endpoint_url_locked
         else -> null
     }
     OutlinedTextField(
         state = field,
         modifier = Modifier.fillMaxWidth(),
-        enabled = state.areUrlsEditable,
-        label = {
-            Text(
-                stringResource(
-                    when (mode) {
-                        RecordingMode.NORMAL -> R.string.endpoint_url_label
-                        RecordingMode.CALIBRATION -> R.string.calibration_url_label
-                    },
-                ),
-            )
-        },
+        enabled = state.isUrlEditable,
+        label = { Text(stringResource(R.string.endpoint_url_label)) },
         supportingText = if (supportingTextRes != null) {
             { Text(stringResource(supportingTextRes)) }
         } else {
             null
         },
-        isError = showError,
+        isError = state.showUrlError,
         keyboardOptions = KeyboardOptions(
             autoCorrectEnabled = false,
             keyboardType = KeyboardType.Uri,
@@ -215,33 +179,25 @@ private fun EndpointUrlField(mode: RecordingMode, state: MainUiState, field: Tex
 }
 
 @Composable
-private fun ModeButton(mode: RecordingMode, action: ModeAction, enabled: Boolean, onClick: () -> Unit) {
-    val colors = when (action) {
-        ModeAction.STOP -> ButtonDefaults.buttonColors(
-            containerColor = MaterialTheme.colorScheme.error,
-            contentColor = MaterialTheme.colorScheme.onError,
-        )
-        ModeAction.SWITCH -> ButtonDefaults.filledTonalButtonColors()
-        ModeAction.START -> ButtonDefaults.buttonColors()
-    }
-    val textRes = when (action) {
-        ModeAction.STOP -> R.string.recording_stop
-        ModeAction.SWITCH -> when (mode) {
-            RecordingMode.NORMAL -> R.string.recording_switch_normal
-            RecordingMode.CALIBRATION -> R.string.recording_switch_calibration
-        }
-        ModeAction.START -> when (mode) {
-            RecordingMode.NORMAL -> R.string.recording_start
-            RecordingMode.CALIBRATION -> R.string.recording_start_calibration
-        }
-    }
+private fun RecordingToggleButton(isRecording: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
         enabled = enabled,
-        colors = colors,
+        colors = if (isRecording) {
+            ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            )
+        } else {
+            ButtonDefaults.buttonColors()
+        },
     ) {
-        Text(stringResource(textRes))
+        Text(
+            stringResource(
+                if (isRecording) R.string.recording_stop else R.string.recording_start,
+            ),
+        )
     }
 }
 
@@ -256,11 +212,7 @@ private fun LiveStatusCard(recording: RecordingState) {
             StatusRow(
                 label = stringResource(R.string.status_state),
                 value = stringResource(
-                    when (recording.mode) {
-                        RecordingMode.NORMAL -> R.string.status_state_normal
-                        RecordingMode.CALIBRATION -> R.string.status_state_calibration
-                        null -> R.string.status_state_off
-                    },
+                    if (recording.isRecording) R.string.status_state_on else R.string.status_state_off,
                 ),
             )
             HorizontalDivider()
@@ -335,10 +287,10 @@ private fun StatusRow(label: String, value: String, labelModifier: Modifier = Mo
 private fun MainScreenStoppedPreview() {
     DuobiuRadarasTheme {
         MainScreen(
-            state = MainUiState(isLoaded = true, validUrls = RecordingMode.entries.toSet()),
-            urlFields = previewUrlFields(),
+            state = MainUiState(isLoaded = true, isUrlValid = true),
+            endpointUrlField = rememberTextFieldState("http://10.0.2.2:3000/api/readings"),
             snackbarHostState = remember { SnackbarHostState() },
-            onModeButton = {},
+            onToggleRecording = {},
         )
     }
 }
@@ -350,24 +302,17 @@ private fun MainScreenRecordingPreview() {
         MainScreen(
             state = MainUiState(
                 isLoaded = true,
-                validUrls = RecordingMode.entries.toSet(),
+                isUrlValid = true,
                 recording = RecordingState(
                     isRecording = true,
-                    mode = RecordingMode.CALIBRATION,
                     sentPackets = 42,
                     location = GeoPoint(latitude = 54.687157, longitude = 25.279652),
                     acceleration = Acceleration(x = 0.12f, y = -0.31f, z = 9.81f),
                 ),
             ),
-            urlFields = previewUrlFields(),
+            endpointUrlField = rememberTextFieldState("http://10.0.2.2:3000/api/readings"),
             snackbarHostState = remember { SnackbarHostState() },
-            onModeButton = {},
+            onToggleRecording = {},
         )
     }
 }
-
-@Composable
-private fun previewUrlFields(): Map<RecordingMode, TextFieldState> = mapOf(
-    RecordingMode.NORMAL to rememberTextFieldState("http://10.0.2.2:8080/packets"),
-    RecordingMode.CALIBRATION to rememberTextFieldState("http://10.0.2.2:8080/calibration"),
-)
