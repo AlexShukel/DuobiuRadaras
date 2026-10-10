@@ -1,1 +1,14 @@
 server/target
+ml/.venv/
+ml/data/
+ml/artifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# collected data and backups (server writes these at runtime)
+server/raw.json
+server/labels.json
+server/potholes.json
+server/backup/
