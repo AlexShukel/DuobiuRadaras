@@ -14,10 +14,11 @@ def generate_chunk(number, mode, amplitude, rng, started_at, latitude, longitude
     samples = []
     for i in range(100):
         impact = amplitude * (1 if i % 2 == 0 else -1) if has_impact and 40 <= i < 60 else 0.0
-        # Synthetic path: latitude moves north; position updates once per chunk.
+        # Synthetic path moves northeast; position updates once per chunk.
         samples.append(dict(x=rng.uniform(-0.03, 0.03), y=rng.uniform(-0.03, 0.03),
                             z=9.81 + rng.uniform(-0.02, 0.02) + impact,
-                            latitude=latitude + number * 0.00005, longitude=longitude))
+                            latitude=latitude + number * 0.00005,
+                            longitude=longitude + number * 0.00005))
     return dict(started_at=started_at, samples=samples), has_impact
 
 def post_json(url, payload):
@@ -46,6 +47,8 @@ def main():
         parser.error('coordinates are out of range')
     if args.latitude + (args.chunks - 1) * 0.00005 > 90:
         parser.error('simulated path goes beyond latitude 90')
+    if args.longitude + (args.chunks - 1) * 0.00005 > 180:
+        parser.error('simulated path goes beyond longitude 180')
     rng = random.Random(args.seed)
     start = time.time_ns() // 1_000_000
     wall_start = time.monotonic()
@@ -59,7 +62,7 @@ def main():
         else:
             status = post_json(args.base_url.rstrip('/') + '/api/readings', chunk)
             print(f'Chunk {number + 1}: HTTP {status}; {"impact" if impact else "smooth"}; '
-                  f'location=({chunk["samples"][0]["latitude"]:.6f}, {args.longitude:.6f})', file=sys.stderr)
+                  f'location=({chunk["samples"][0]["latitude"]:.6f}, {chunk["samples"][0]["longitude"]:.6f})', file=sys.stderr)
 
 if __name__ == '__main__':
     try:

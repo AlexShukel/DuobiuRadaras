@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 const WINDOW_SIZE: usize = 20;
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
 const POTHOLES_PATH: &str = "./potholes.json";
+const POTHOLE_GROUP_RADIUS_M: f64 = 10.0;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
 struct PotholeLocation {
@@ -27,11 +28,6 @@ struct Sample {
     z: f64,
     latitude: f64,
     longitude: f64   
-}
-
-#[derive(Clone)]
-struct Config {
-    threshold: f64
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -227,8 +223,20 @@ fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mut potholes = read_potholes()?;
-    potholes.extend(locations);
+    let mut potholes = Vec::new();
+
+    // Also remove nearby duplicates already stored in the file.
+    for location in read_potholes()? {
+        add_unique_pothole(&mut potholes, location);
+    }
+
+    let mut added = 0;
+
+    for location in locations {
+        if add_unique_pothole(&mut potholes, location) {
+            added += 1;
+        }
+    }
 
     let json = serde_json::to_string_pretty(&potholes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -236,7 +244,43 @@ fn save_potholes(locations: Vec<PotholeLocation>) -> Result<(), StatusCode> {
     fs::write(POTHOLES_PATH, json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    if added > 0 {
+        println!("Saved {added} new pothole locations");
+    }
+
     Ok(())
+}
+
+fn distance_meters(a: &PotholeLocation, b: &PotholeLocation) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+    let mean_latitude = ((a.latitude + b.latitude) / 2.0).to_radians();
+
+    let north = (b.latitude - a.latitude).to_radians()
+        * EARTH_RADIUS_M;
+
+    let east = (b.longitude - a.longitude).to_radians()
+        * EARTH_RADIUS_M
+        * mean_latitude.cos();
+
+    north.hypot(east) // sqrt(north² + east²)
+}
+
+/// Returns true when a new location is added.
+fn add_unique_pothole(
+    potholes: &mut Vec<PotholeLocation>,
+    location: PotholeLocation,
+) -> bool {
+    let already_known = potholes.iter().any(|existing| {
+        distance_meters(existing, &location) <= POTHOLE_GROUP_RADIUS_M
+    });
+
+    if already_known {
+        return false;
+    }
+
+    potholes.push(location);
+    true
 }
 
 #[cfg(test)]
@@ -400,5 +444,76 @@ mod tests {
         let locations = detect_pothole_locations(&chunk, 2.0);
 
         assert!(locations.is_empty());
+    }
+
+    #[test]
+    fn same_location_is_saved_only_once() {
+        let mut potholes = Vec::new();
+
+        assert!(add_unique_pothole(
+            &mut potholes,
+            PotholeLocation {
+                latitude: 54.6872,
+                longitude: 25.2797,
+            },
+        ));
+
+        assert!(!add_unique_pothole(
+            &mut potholes,
+            PotholeLocation {
+                latitude: 54.6872,
+                longitude: 25.2797,
+            },
+        ));
+
+        assert_eq!(potholes.len(), 1);
+    }
+
+    #[test]
+    fn nearby_location_is_skipped_and_original_is_preserved() {
+        let original = PotholeLocation {
+            latitude: 54.6872,
+            longitude: 25.2797,
+        };
+
+        let mut potholes = vec![original];
+
+        // Approximately 5.6 metres north.
+        let added = add_unique_pothole(
+            &mut potholes,
+            PotholeLocation {
+                latitude: 54.68725,
+                longitude: 25.2797,
+            },
+        );
+
+        assert!(!added);
+        assert_eq!(
+            potholes,
+            vec![PotholeLocation {
+                latitude: 54.6872,
+                longitude: 25.2797,
+            }]
+        );
+    }
+
+    #[test]
+    fn distant_location_is_saved_separately() {
+        let mut potholes = vec![PotholeLocation {
+            latitude: 54.6872,
+            longitude: 25.2797,
+        }];
+
+        // Approximately 111 metres north.
+        let added = add_unique_pothole(
+            &mut potholes,
+            PotholeLocation {
+                latitude: 54.6882,
+                longitude: 25.2797,
+            },
+        );
+
+        assert!(added);
+        assert_eq!(potholes.len(), 2);
     }
 }
