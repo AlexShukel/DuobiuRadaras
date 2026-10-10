@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Sensors</title>
+<style>
+/* layout: status strip, controls row, one tall chart; everything else is text */
+:root {
+  --bg: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --x: #2a78d6; --y: #eb6834; --z: #1baf7a; --mag: #52514e; --pothole: #6250d6; --bump: #e34948;
+  --good: #0ca30c; --warn: #fab219; --bad: #d03b3b;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --x: #3987e5; --y: #d95926; --z: #199e70; --mag: #c3c2b7; --pothole: #9085e9; --bump: #e66767;
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --x: #3987e5; --y: #d95926; --z: #199e70; --mag: #c3c2b7; --pothole: #9085e9; --bump: #e66767;
+  color-scheme: dark; }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 14px;
+  display: flex; flex-direction: column; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); background: var(--surface); }
+h1 { font-size: 1.05rem; margin: 0 8px 0 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px;
+  font-size: 0.8rem; font-weight: 600; border: 1px solid var(--border); }
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.live i { background: var(--good); } .pill.stale i { background: var(--warn); } .pill.offline i { background: var(--bad); }
+.stat { font-size: 0.82rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.stat b { color: var(--ink); font-weight: 600; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 16px; font-size: 0.85rem; color: var(--ink-2); }
+.controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.controls .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+select, button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px; }
+button { cursor: pointer; } button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--x); outline-offset: 1px; }
+main { flex: 1; min-height: 260px; position: relative; padding: 0 16px 12px; }
+canvas { width: 100%; height: 100%; display: block; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; touch-action: pan-y; }
+#tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 8px; font-size: 0.78rem; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+#tip b { color: var(--ink); }
+footer { padding: 6px 16px 10px; font-size: 0.78rem; color: var(--muted); }
+footer a { color: var(--ink-2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live sensors</h1>
+  <span id="status" class="pill offline"><i></i><span id="statusText">connecting</span></span>
+  <span class="stat">last chunk <b id="age">–</b></span>
+  <span class="stat">chunks <b id="chunks">0</b></span>
+  <span class="stat">rate <b id="rate">–</b> Hz</span>
+  <span class="stat">position <b id="pos">–</b></span>
+  <span class="stat">labels <b id="labels">0</b></span>
+</header>
+<div class="controls">
+  <label>window <select id="window">
+    <option value="30">30 s</option><option value="60">1 min</option><option value="120" selected>2 min</option>
+    <option value="300">5 min</option><option value="600">10 min</option></select></label>
+  <label><input type="checkbox" id="chX" checked><i class="sw" style="background:var(--x)"></i>x</label>
+  <label><input type="checkbox" id="chY" checked><i class="sw" style="background:var(--y)"></i>y</label>
+  <label><input type="checkbox" id="chZ" checked><i class="sw" style="background:var(--z)"></i>z</label>
+  <label><input type="checkbox" id="chM"><i class="sw" style="background:var(--mag)"></i>|a|</label>
+  <label>y scale <select id="yscale"><option value="auto" selected>auto</option><option value="20">±20 m/s²</option><option value="40">±40 m/s²</option></select></label>
+  <button id="pause" type="button">Pause</button>
+  <span class="stat" style="margin-left:auto">labels: <i class="sw" style="background:var(--pothole);height:12px;width:3px"></i> pothole <i class="sw" style="background:var(--bump);height:12px;width:3px"></i> bump</span>
+</div>
+<main>
+  <canvas id="plot"></canvas>
+  <div id="tip"></div>
+</main>
+<footer>Polls <a href="/api/raw">/api/raw</a> every second. Keeps the last 10 minutes in the browser; the server keeps the same in memory and writes everything to raw.json.</footer>
+<script>
+(function () {
+  "use strict";
+  const PERIOD_MS = 25, KEEP_MS = 10 * 60 * 1000, POLL_MS = 1000;
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("plot"), ctx = canvas.getContext("2d"), tip = $("tip");
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // --- data -----------------------------------------------------------------
+  // Parallel arrays keep drawing cheap: 10 min at 40 Hz is 24k points.
+  const T = [], X = [], Y = [], Z = [], M = [], LAT = [], LON = [];
+  const labels = [];              // {t, label}
+  let cursor = 0, chunkCount = 0, lastChunkAt = 0, lastReceivedAt = 0, paused = false, dirty = true;
+  let hover = null;               // sample index under the pointer
+
+  function parseStart(value) {
+    if (typeof value === "number") return value;
+    if (/^\d+$/.test(value)) return Number(value);
+    const t = Date.parse(value);
+    return Number.isFinite(t) ? t : NaN;
+  }
+
+  function addChunk(chunk) {
+    const t0 = parseStart(chunk.started_at);
+    if (!Number.isFinite(t0)) return;
+    for (let i = 0; i < chunk.samples.length; i++) {
+      const s = chunk.samples[i];
+      T.push(t0 + i * PERIOD_MS); X.push(s.x); Y.push(s.y); Z.push(s.z);
+      M.push(Math.hypot(s.x, s.y, s.z)); LAT.push(s.latitude); LON.push(s.longitude);
+    }
+    chunkCount++;
+    lastChunkAt = Math.max(lastChunkAt, t0 + (chunk.samples.length - 1) * PERIOD_MS);
+  }
+
+  function trim() {
+    const limit = (T.length ? T[T.length - 1] : 0) - KEEP_MS;
+    let n = 0;
+    while (n < T.length && T[n] < limit) n++;
+    if (n) { [T, X, Y, Z, M, LAT, LON].forEach((a) => a.splice(0, n)); }
+    while (labels.length && labels[0].t < limit) labels.shift();
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch(`/api/raw?after=${cursor}`, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = await r.json();
+      lastReceivedAt = Date.now();
+      if (!paused) {
+        body.chunks.forEach(addChunk);
+        body.labels.forEach((l) => labels.push({ t: l.timestamp, label: l.label }));
+        labels.sort((a, b) => a.t - b.t);
+        cursor = body.next;
+        trim();
+        if (body.chunks.length || body.labels.length) dirty = true;
+      }
+      setStatus();
+    } catch (err) {
+      setStatus(err);
+    } finally {
+      setTimeout(poll, POLL_MS);
+    }
+  }
+
+  function setStatus(err) {
+    const pill = $("status");
+    const ageMs = lastChunkAt ? Date.now() - lastChunkAt : null;
+    let cls = "offline", text = "offline";
+    if (!err) {
+      if (ageMs !== null && ageMs < 6000) { cls = "live"; text = paused ? "paused" : "live"; }
+      else { cls = "stale"; text = lastChunkAt ? "no new data" : "waiting for data"; }
+    } else { text = "server unreachable"; }
+    pill.className = `pill ${cls}`;
+    $("statusText").textContent = text;
+    $("age").textContent = ageMs === null ? "–" : ageMs < 1000 ? "now" : `${(ageMs / 1000).toFixed(ageMs < 60000 ? 1 : 0)} s ago`;
+    $("chunks").textContent = chunkCount;
+    $("labels").textContent = labels.length;
+    const n = T.length;
+    if (n > 40) {
+      const span = (T[n - 1] - T[Math.max(0, n - 400)]) / 1000;
+      $("rate").textContent = span > 0 ? (Math.min(400, n) / span).toFixed(1) : "–";
+      $("pos").textContent = `${LAT[n - 1].toFixed(5)}, ${LON[n - 1].toFixed(5)}`;
+    }
+  }
+
+  // --- drawing --------------------------------------------------------------
+  const PAD = { l: 48, r: 14, t: 24, b: 26 };
+  function niceStep(span, target) {
+    const raw = span / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    return [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag;
+  }
+  function timeStep(windowS) { return windowS <= 30 ? 5 : windowS <= 60 ? 10 : windowS <= 120 ? 20 : windowS <= 300 ? 60 : 120; }
+  function clock(ms) { const d = new Date(ms); return d.toTimeString().slice(0, 8); }
+
+  function resize() {
+    const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(r.width * dpr) || canvas.height !== Math.round(r.height * dpr)) {
+      canvas.width = Math.round(r.width * dpr); canvas.height = Math.round(r.height * dpr);
+    }
+    dirty = true;
+  }
+
+  function draw() {
+    requestAnimationFrame(draw);
+    if (!dirty) return;
+    dirty = false;
+    const dpr = window.devicePixelRatio || 1, W = canvas.width / dpr, H = canvas.height / dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = "11px " + css("--font");
+    const windowS = Number($("window").value);
+    const tEnd = T.length ? T[T.length - 1] : Date.now(), tStart = tEnd - windowS * 1000;
+    const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+    const xOf = (t) => PAD.l + (t - tStart) / (windowS * 1000) * plotW;
+
+    const series = [
+      ["x", X, "--x", $("chX").checked], ["y", Y, "--y", $("chY").checked],
+      ["z", Z, "--z", $("chZ").checked], ["|a|", M, "--mag", $("chM").checked],
+    ].filter((s) => s[3]);
+
+    // visible index range
+    let i0 = 0; while (i0 < T.length && T[i0] < tStart) i0++;
+    i0 = Math.max(0, i0 - 1);
+    const i1 = T.length;
+
+    // y range
+    let lo = Infinity, hi = -Infinity;
+    const fixed = $("yscale").value;
+    if (fixed !== "auto") { lo = -Number(fixed); hi = Number(fixed); }
+    else {
+      for (const [, A] of series) for (let i = i0; i < i1; i++) { if (A[i] < lo) lo = A[i]; if (A[i] > hi) hi = A[i]; }
+      if (!Number.isFinite(lo)) { lo = -2; hi = 12; }
+      const pad = Math.max(0.5, (hi - lo) * 0.1); lo -= pad; hi += pad;
+    }
+    const yOf = (v) => PAD.t + (hi - v) / (hi - lo) * plotH;
+
+    // grid + axes
+    ctx.lineWidth = 1; ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    const ys = niceStep(hi - lo, 6);
+    for (let v = Math.ceil(lo / ys) * ys; v <= hi; v += ys) {
+      const y = yOf(v); ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(W - PAD.r, y); ctx.stroke();
+      ctx.fillText(Number(v.toFixed(2)).toString(), PAD.l - 6, y);
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const ts = timeStep(windowS) * 1000;
+    for (let t = Math.ceil(tStart / ts) * ts; t <= tEnd; t += ts) {
+      const x = xOf(t); ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+      ctx.fillText(clock(t), x, H - PAD.b + 6);
+    }
+    ctx.strokeStyle = css("--axis"); ctx.beginPath(); ctx.moveTo(PAD.l, H - PAD.b); ctx.lineTo(W - PAD.r, H - PAD.b); ctx.stroke();
+    if (lo < 0 && hi > 0) { ctx.beginPath(); ctx.moveTo(PAD.l, yOf(0)); ctx.lineTo(W - PAD.r, yOf(0)); ctx.stroke(); }
+    ctx.save(); ctx.translate(12, PAD.t + plotH / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText("m/s²", 0, 0); ctx.restore();
+
+    // label markers
+    for (const l of labels) {
+      if (l.t < tStart || l.t > tEnd) continue;
+      const x = xOf(l.t); ctx.strokeStyle = css(l.label === "bump" ? "--bump" : "--pothole"); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, PAD.t - 4); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+      ctx.fillStyle = css("--ink-2"); ctx.textAlign = "left"; ctx.textBaseline = "bottom"; ctx.fillText(l.label, x + 4, PAD.t - 2);
+    }
+
+    // series
+    ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW, plotH); ctx.clip();
+    ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+    for (const [, A, token] of series) {
+      ctx.strokeStyle = css(token); ctx.beginPath();
+      let pen = false;
+      for (let i = i0; i < i1; i++) {
+        if (i > i0 && T[i] - T[i - 1] > PERIOD_MS * 4) pen = false;   // gap between packets: lift the pen
+        const x = xOf(T[i]), y = yOf(A[i]);
+        if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // legend (top-right) and hover crosshair
+    ctx.textAlign = "left"; ctx.textBaseline = "middle"; let lx = W - PAD.r - 8;
+    for (const [name, , token] of [...series].reverse()) {
+      const w = ctx.measureText(name).width; lx -= w + 22;
+      ctx.fillStyle = css(token); ctx.fillRect(lx, PAD.t - 13, 14, 3); ctx.fillStyle = css("--ink-2"); ctx.fillText(name, lx + 18, PAD.t - 12);
+    }
+    if (hover !== null && hover >= i0 && hover < i1) {
+      const x = xOf(T[hover]); ctx.strokeStyle = css("--axis"); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
+      for (const [, A, token] of series) {
+        const y = yOf(A[hover]); ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.fillStyle = css("--surface"); ctx.fill();
+        ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fillStyle = css(token); ctx.fill();
+      }
+    }
+    if (!T.length) {
+      ctx.fillStyle = css("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("Waiting for the first packet on POST /api/raw", W / 2, H / 2);
+    }
+  }
+
+  // --- interaction ------------------------------------------------------------
+  function onMove(ev) {
+    if (!T.length) return;
+    const r = canvas.getBoundingClientRect(), W = r.width;
+    const windowS = Number($("window").value), tEnd = T[T.length - 1], tStart = tEnd - windowS * 1000;
+    const t = tStart + (ev.clientX - r.left - PAD.l) / (W - PAD.l - PAD.r) * windowS * 1000;
+    let lo = 0, hi = T.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (T[mid] < t) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && Math.abs(T[lo - 1] - t) < Math.abs(T[lo] - t)) lo--;
+    hover = lo; dirty = true;
+    tip.innerHTML = `<b>${clock(T[lo])}</b>.${String(T[lo] % 1000).padStart(3, "0")}<br>` +
+      `x <b>${X[lo].toFixed(2)}</b> &nbsp;y <b>${Y[lo].toFixed(2)}</b> &nbsp;z <b>${Z[lo].toFixed(2)}</b> &nbsp;|a| <b>${M[lo].toFixed(2)}</b><br>` +
+      `${LAT[lo].toFixed(6)}, ${LON[lo].toFixed(6)}`;
+    tip.style.display = "block";
+    const main = canvas.parentElement.getBoundingClientRect();
+    const left = ev.clientX - main.left + 14, top = ev.clientY - main.top + 14;
+    tip.style.left = Math.min(left, main.width - tip.offsetWidth - 8) + "px";
+    tip.style.top = Math.min(top, main.height - tip.offsetHeight - 8) + "px";
+  }
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerleave", () => { hover = null; tip.style.display = "none"; dirty = true; });
+  ["window", "chX", "chY", "chZ", "chM", "yscale"].forEach((id) => $(id).addEventListener("change", () => { dirty = true; }));
+  $("pause").addEventListener("click", () => {
+    paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause"; setStatus();
+  });
+  window.addEventListener("resize", resize);
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { dirty = true; });
+  setInterval(() => { setStatus(); }, 1000);
+
+  resize();
+  requestAnimationFrame(draw);
+  poll();
+})();
+</script>
+</body>
+</html>

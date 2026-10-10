@@ -1,11 +1,15 @@
 use core::f64;
-use std::{fs, io, time::Instant};
+use std::{collections::VecDeque, fs, io, time::Instant};
 
 use axum::{Json, Router, http::StatusCode, routing::{get, post}};
 use serde::{Deserialize, Serialize};
-use axum::{extract::Request, middleware::{self, Next}, response::Response};
+use axum::{extract::{Query, Request}, middleware::{self, Next}, response::{Html, Response}};
 
 const WINDOW_SIZE: usize = 20;
+/// How many recent raw chunks (2 s each) the live view keeps in memory: 300 = 10 minutes.
+const LIVE_CHUNK_CAPACITY: usize = 300;
+const LIVE_LABEL_CAPACITY: usize = 500;
+const UI_HTML: &str = include_str!("ui.html");
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
 const POTHOLES_PATH: &str = "./potholes.json";
 const RAW: &str = "./raw.json";
@@ -18,13 +22,13 @@ struct PotholeLocation {
     longitude: f64,
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 struct SampleChunk {
-    started_at: String, // in milliseconds
+    started_at: String, // ISO 8601 (the mobile app) or unix milliseconds
     samples: Vec<Sample>
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 struct Sample {
     x: f64,
     y: f64,
@@ -38,7 +42,7 @@ struct CalibrationTable {
     thresholds: Vec<f64>
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct LabeledEvent {
     timestamp: u64, // Unix timestamp in milliseconds
     latitude: f64,
@@ -46,7 +50,7 @@ struct LabeledEvent {
     label: EventLabel,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum EventLabel {
     Pothole,
@@ -60,13 +64,19 @@ async fn main() -> io::Result<()> {
         .route("/api/potholes", get(get_potholes))
         .route("/api/calibration", post(post_calibration))
         .route("/api/health", get(get_health))
-        .route("/api/raw", post(post_raw))
+        .route("/api/raw", post(post_raw).get(get_raw_live))
         .route("/api/label", post(post_label))
+        .route("/", get(get_ui))
+        .route("/live", get(get_ui))
         .layer(middleware::from_fn(log_request));
 
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
     println!("[INFO] Data directory: {}", std::env::current_dir()?.display());
     println!("[INFO] Calibration file: {CALIBRATION_TABLE_PATH}; potholes file: {POTHOLES_PATH}");
+    match load_live_buffer_from_disk() {
+        Ok((chunks, labels)) => println!("[INFO] Live view preloaded {chunks} chunks and {labels} labels from disk"),
+        Err(error) => eprintln!("[WARN] Live view starts empty: {error}"),
+    }
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_owned());
     let address = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&address).await.map_err(|error| {
@@ -124,6 +134,9 @@ async fn post_label(
     })?;
 
     println!("[INFO] Appended labeled event; total_labels={}", events.len());
+    if let Some(event) = events.last() {
+        push_live_label(event.clone());
+    }
 
     Ok(StatusCode::OK)
 }
@@ -170,6 +183,7 @@ async fn post_raw(
     };
 
     let sample_count = sample_chunk.samples.len();
+    let live_copy = sample_chunk.clone();
     chunks.push(sample_chunk);
 
     let json = serde_json::to_string_pretty(&chunks).map_err(|error| {
@@ -186,8 +200,143 @@ async fn post_raw(
         "[INFO] Appended {sample_count} raw samples; total_chunks={}",
         chunks.len()
     );
+    push_live_chunk(live_copy);
 
     Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// Live view: an in-memory ring buffer of recent chunks and labels, served to the
+// browser page at `/` which polls `GET /api/raw?after=<seq>` about once a second.
+// Chunks and labels share one sequence counter so a single cursor covers both.
+
+#[derive(Debug, Serialize, Clone)]
+struct LiveChunk {
+    seq: u64,
+    #[serde(flatten)]
+    chunk: SampleChunk,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct LiveLabel {
+    seq: u64,
+    #[serde(flatten)]
+    event: LabeledEvent,
+}
+
+struct LiveBuffer {
+    next_seq: u64,
+    chunks: VecDeque<LiveChunk>,
+    labels: VecDeque<LiveLabel>,
+}
+
+impl LiveBuffer {
+    fn push_chunk(&mut self, chunk: SampleChunk) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.chunks.push_back(LiveChunk { seq, chunk });
+        while self.chunks.len() > LIVE_CHUNK_CAPACITY {
+            self.chunks.pop_front();
+        }
+        seq
+    }
+
+    fn push_label(&mut self, event: LabeledEvent) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.labels.push_back(LiveLabel { seq, event });
+        while self.labels.len() > LIVE_LABEL_CAPACITY {
+            self.labels.pop_front();
+        }
+        seq
+    }
+
+    /// Everything with a sequence number strictly greater than `after`.
+    fn since(&self, after: u64) -> LiveResponse {
+        let first_new = |seq: u64| seq > after;
+        LiveResponse {
+            next: self.next_seq.saturating_sub(1),
+            chunks: self.chunks.iter().filter(|c| first_new(c.seq)).cloned().collect(),
+            labels: self.labels.iter().filter(|l| first_new(l.seq)).cloned().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LiveResponse {
+    /// Pass this back as `?after=` to receive only newer items next time.
+    next: u64,
+    chunks: Vec<LiveChunk>,
+    labels: Vec<LiveLabel>,
+}
+
+#[derive(Deserialize)]
+struct LiveQuery {
+    /// Last sequence number the client has seen; omitted or 0 means "send the whole buffer".
+    after: Option<u64>,
+}
+
+static LIVE_BUFFER: std::sync::Mutex<LiveBuffer> = std::sync::Mutex::new(LiveBuffer {
+    next_seq: 1,
+    chunks: VecDeque::new(),
+    labels: VecDeque::new(),
+});
+
+fn push_live_chunk(chunk: SampleChunk) {
+    match LIVE_BUFFER.lock() {
+        Ok(mut buffer) => { buffer.push_chunk(chunk); }
+        Err(error) => eprintln!("[ERROR] live buffer lock failed: {error}"),
+    }
+}
+
+fn push_live_label(event: LabeledEvent) {
+    match LIVE_BUFFER.lock() {
+        Ok(mut buffer) => { buffer.push_label(event); }
+        Err(error) => eprintln!("[ERROR] live buffer lock failed: {error}"),
+    }
+}
+
+/// Seed the buffer from raw.json / labels.json so the page shows history after a restart.
+fn load_live_buffer_from_disk() -> Result<(usize, usize), String> {
+    let chunks: Vec<SampleChunk> = match fs::read_to_string(RAW) {
+        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{RAW}: {e}"))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("{RAW}: {error}")),
+    };
+    let labels: Vec<LabeledEvent> = match fs::read_to_string(LABELS_PATH) {
+        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("{LABELS_PATH}: {e}"))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("{LABELS_PATH}: {error}")),
+    };
+    let mut buffer = LIVE_BUFFER.lock().map_err(|e| format!("lock: {e}"))?;
+    let skip = chunks.len().saturating_sub(LIVE_CHUNK_CAPACITY);
+    let mut n_chunks = 0;
+    for chunk in chunks.into_iter().skip(skip) {
+        buffer.push_chunk(chunk);
+        n_chunks += 1;
+    }
+    let skip = labels.len().saturating_sub(LIVE_LABEL_CAPACITY);
+    let mut n_labels = 0;
+    for label in labels.into_iter().skip(skip) {
+        buffer.push_label(label);
+        n_labels += 1;
+    }
+    Ok((n_chunks, n_labels))
+}
+
+async fn get_raw_live(Query(query): Query<LiveQuery>) -> Result<Json<LiveResponse>, StatusCode> {
+    let buffer = LIVE_BUFFER.lock().map_err(|error| {
+        eprintln!("[ERROR] GET /api/raw: lock failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let response = buffer.since(query.after.unwrap_or(0));
+    println!("[INFO] GET /api/raw: after={} -> chunks={} labels={} next={}",
+        query.after.unwrap_or(0), response.chunks.len(), response.labels.len(), response.next);
+    Ok(Json(response))
+}
+
+async fn get_ui() -> Html<&'static str> {
+    Html(UI_HTML)
 }
 
 async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCode, StatusCode> {
@@ -488,6 +637,61 @@ fn add_unique_pothole(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chunk(started_at: &str) -> SampleChunk {
+        SampleChunk {
+            started_at: started_at.to_owned(),
+            samples: vec![Sample { x: 0.0, y: 0.0, z: 9.8, latitude: 54.0, longitude: 25.0 }],
+        }
+    }
+
+    fn fresh_buffer() -> LiveBuffer {
+        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new() }
+    }
+
+    #[test]
+    fn live_buffer_cursor_returns_only_newer_items() {
+        let mut buffer = fresh_buffer();
+        let first = buffer.push_chunk(chunk("a"));
+        let label_seq = buffer.push_label(LabeledEvent {
+            timestamp: 1, latitude: 54.0, longitude: 25.0, label: EventLabel::Bump,
+        });
+        let second = buffer.push_chunk(chunk("b"));
+        assert_eq!((first, label_seq, second), (1, 2, 3));
+
+        let all = buffer.since(0);
+        assert_eq!(all.chunks.len(), 2);
+        assert_eq!(all.labels.len(), 1);
+        assert_eq!(all.next, 3);
+
+        let newer = buffer.since(all.next);
+        assert!(newer.chunks.is_empty() && newer.labels.is_empty());
+        assert_eq!(newer.next, 3);
+
+        let after_first = buffer.since(first);
+        assert_eq!(after_first.chunks.len(), 1);
+        assert_eq!(after_first.chunks[0].chunk.started_at, "b");
+        assert_eq!(after_first.labels.len(), 1);
+    }
+
+    #[test]
+    fn live_buffer_drops_oldest_chunks_beyond_capacity() {
+        let mut buffer = fresh_buffer();
+        for i in 0..(LIVE_CHUNK_CAPACITY + 5) {
+            buffer.push_chunk(chunk(&i.to_string()));
+        }
+        assert_eq!(buffer.chunks.len(), LIVE_CHUNK_CAPACITY);
+        assert_eq!(buffer.chunks.front().unwrap().chunk.started_at, "5");
+        assert_eq!(buffer.since(0).next, (LIVE_CHUNK_CAPACITY + 5) as u64);
+    }
+
+    #[test]
+    fn live_chunk_serializes_flat() {
+        let json = serde_json::to_value(LiveChunk { seq: 7, chunk: chunk("t") }).unwrap();
+        assert_eq!(json["seq"], 7);
+        assert_eq!(json["started_at"], "t");
+        assert_eq!(json["samples"][0]["z"], 9.8);
+    }
 
     #[test]
     fn stdev_first_dataset_window_matches_expected_value() {
