@@ -19,10 +19,13 @@ use axum::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const WINDOW_SIZE: usize = 20;
-/// How many recent raw chunks (2 s each) the live view keeps in memory per device: 300 = 10 minutes.
-const LIVE_CHUNK_CAPACITY: usize = 300;
-const LIVE_LABEL_CAPACITY: usize = 500;
+/// How many recent raw chunks (2 s each) the live view keeps in memory per device: 10800 = 6 hours.
+/// A chunk is about 3 KB in memory, so a full buffer is roughly 35 MB per device.
+const LIVE_CHUNK_CAPACITY: usize = 10_800;
+const LIVE_LABEL_CAPACITY: usize = 5_000;
 const UI_HTML: &str = include_str!("ui.html");
+/// Relative to the working directory, which is `server/` when started with `cargo run` there.
+const UI_HTML_PATH: &str = "./src/ui.html";
 /// Every device gets its own folder here, named after its IP address:
 /// `devices/<ip>/raw.json`, `devices/<ip>/labels.json`, `devices/<ip>/calibration.json`.
 const DEVICES_DIR: &str = "./devices";
@@ -68,7 +71,7 @@ struct LabeledEvent {
     label: EventLabel,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum EventLabel {
     Pothole,
@@ -83,7 +86,7 @@ async fn main() -> io::Result<()> {
         .route("/api/calibration", post(post_calibration))
         .route("/api/health", get(get_health))
         .route("/api/raw", post(post_raw).get(get_raw_live))
-        .route("/api/label", post(post_label))
+        .route("/api/label", post(post_label).delete(delete_label))
         .route("/api/devices", get(get_devices))
         .route("/", get(get_ui))
         .route("/live", get(get_ui))
@@ -128,6 +131,9 @@ struct Device {
     live: LiveBuffer,
     /// Unix milliseconds of the last request from this device (or the newest data file after a restart).
     last_seen_ms: u64,
+    /// Elements in raw.json / labels.json, counted at preload and kept up to date by appends.
+    chunks_on_disk: usize,
+    labels_on_disk: usize,
 }
 
 type SharedDevice = Arc<Mutex<Device>>;
@@ -142,6 +148,8 @@ impl Device {
             dir: Path::new(DEVICES_DIR).join(device_dir_name(ip)),
             live: LiveBuffer::new(),
             last_seen_ms: 0,
+            chunks_on_disk: 0,
+            labels_on_disk: 0,
         }
     }
 
@@ -161,6 +169,8 @@ impl Device {
             .map_err(|e| format!("{}: {e}", raw_path.display()))?;
         let labels: Vec<LabeledEvent> = read_json_array(&labels_path)
             .map_err(|e| format!("{}: {e}", labels_path.display()))?;
+        self.chunks_on_disk = chunks.len();
+        self.labels_on_disk = labels.len();
 
         let skip = chunks.len().saturating_sub(LIVE_CHUNK_CAPACITY);
         let mut n_chunks = 0;
@@ -313,6 +323,50 @@ fn read_json_array_or_500<T: DeserializeOwned>(path: &Path, context: &str) -> Re
     })
 }
 
+/// Append one element to a JSON array file in place: only the closing `]` is rewritten, so a
+/// chunk every 2 s costs the same whether the file holds 10 chunks or 10 000. The file stays a
+/// valid pretty-printed array that `json.load` reads as before. A missing or empty file is created.
+fn append_json_array_element<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let element = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+    let len = file.metadata()?.len();
+
+    // Look at the tail: find the closing bracket and whether anything precedes it besides `[`.
+    let tail_len = len.min(4096);
+    file.seek(SeekFrom::Start(len - tail_len))?;
+    let mut tail = Vec::with_capacity(tail_len as usize);
+    file.read_to_end(&mut tail)?;
+    let trimmed = tail.iter().rposition(|b| !b.is_ascii_whitespace()).map(|i| &tail[..=i]).unwrap_or(&[]);
+
+    let (truncate_to, prefix) = if trimmed.is_empty() {
+        (0, "[\n")
+    } else if trimmed.last() != Some(&b']') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file does not end with a JSON array"));
+    } else {
+        let bracket_at = len - tail_len + trimmed.len() as u64 - 1;
+        let before_bracket = &trimmed[..trimmed.len() - 1];
+        // The array is empty only when the whole file is in the tail and nothing but `[` precedes `]`.
+        let array_is_empty = tail_len == len
+            && before_bracket.iter().all(|b| b.is_ascii_whitespace() || *b == b'[');
+        if array_is_empty && !before_bracket.contains(&b'[') {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "file has a closing bracket but no opening one"));
+        }
+        (bracket_at, if array_is_empty { "\n" } else { ",\n" })
+    };
+
+    file.set_len(truncate_to)?;
+    file.seek(SeekFrom::Start(truncate_to))?;
+    file.write_all(prefix.as_bytes())?;
+    file.write_all(element.as_bytes())?;
+    file.write_all(b"\n]")?;
+    file.flush()
+}
+
 fn write_json_or_500<T: Serialize>(path: &Path, value: &T, pretty: bool, context: &str) -> Result<(), StatusCode> {
     let json = if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) }
         .map_err(|error| {
@@ -357,14 +411,23 @@ async fn get_devices() -> Result<Json<Vec<DeviceSummary>>, StatusCode> {
     Ok(Json(summaries))
 }
 
+#[derive(Deserialize)]
+struct LabelQuery {
+    /// Label another device's data (the live page does this when a viewer marks an event on a chart).
+    /// Omitted: the label belongs to the device sending the request.
+    device: Option<String>,
+}
+
 async fn post_label(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<LabelQuery>,
     Json(event): Json<LabeledEvent>,
 ) -> Result<StatusCode, StatusCode> {
-    let ip = client_ip(&headers, peer);
-    println!("[INFO] POST /api/label: device={ip}, timestamp={}, latitude={}, longitude={}, label={:?}",
-        event.timestamp, event.latitude, event.longitude, event.label);
+    let sender = client_ip(&headers, peer);
+    let target: Option<String> = query.device.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    println!("[INFO] POST /api/label: from={sender}, device={}, timestamp={}, latitude={}, longitude={}, label={:?}",
+        target.as_deref().unwrap_or(&sender), event.timestamp, event.latitude, event.longitude, event.label);
 
     if !event.latitude.is_finite()
         || !event.longitude.is_finite()
@@ -375,16 +438,68 @@ async fn post_label(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let device = device_for(&ip)?;
+    // A label for another device must name one we already know; a typo must not create a folder.
+    let device = match &target {
+        Some(ip) => registered_device(ip)?.ok_or_else(|| {
+            eprintln!("[WARN] POST /api/label: unknown device {ip}; status=404");
+            StatusCode::NOT_FOUND
+        })?,
+        None => device_for(&sender)?,
+    };
     run_blocking(move || {
         let mut device = lock_or_500(&device, "device")?;
-        device.touch();
+        if target.is_none() {
+            device.touch();
+        }
         let path = device.labels_path();
-        let mut events: Vec<LabeledEvent> = read_json_array_or_500(&path, "POST /api/label")?;
-        events.push(event.clone());
-        write_json_or_500(&path, &events, true, "POST /api/label")?;
-        println!("[INFO] Device {}: appended labeled event; total_labels={}", device.ip, events.len());
+        append_json_array_element(&path, &event).map_err(|error| {
+            eprintln!("[ERROR] POST /api/label: cannot append to {}: {error}", path.display());
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        device.labels_on_disk += 1;
+        println!("[INFO] Device {}: appended labeled event; total_labels={}", device.ip, device.labels_on_disk);
         device.live.push_label(event);
+        Ok(StatusCode::OK)
+    }).await
+}
+
+/// Identifies one stored label: the moment and the kind. Used to undo a label added by mistake.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct LabelKey {
+    timestamp: u64,
+    label: EventLabel,
+}
+
+/// `DELETE /api/label?device=<ip>` with `{timestamp, label}`: removes the newest matching label
+/// from that device's labels.json and tells live viewers to drop its marker.
+async fn delete_label(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<LabelQuery>,
+    Json(key): Json<LabelKey>,
+) -> Result<StatusCode, StatusCode> {
+    let sender = client_ip(&headers, peer);
+    let target: Option<String> = query.device.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    let ip = target.unwrap_or(sender);
+    println!("[INFO] DELETE /api/label: device={ip}, timestamp={}, label={:?}", key.timestamp, key.label);
+
+    let device = registered_device(&ip)?.ok_or_else(|| {
+        eprintln!("[WARN] DELETE /api/label: unknown device {ip}; status=404");
+        StatusCode::NOT_FOUND
+    })?;
+    run_blocking(move || {
+        let mut device = lock_or_500(&device, "device")?;
+        let path = device.labels_path();
+        let mut events: Vec<LabeledEvent> = read_json_array_or_500(&path, "DELETE /api/label")?;
+        let Some(index) = events.iter().rposition(|e| e.timestamp == key.timestamp && e.label == key.label) else {
+            eprintln!("[WARN] DELETE /api/label: device {}: no label {:?} at {}; status=404", device.ip, key.label, key.timestamp);
+            return Err(StatusCode::NOT_FOUND);
+        };
+        events.remove(index);
+        write_json_or_500(&path, &events, true, "DELETE /api/label")?;
+        device.labels_on_disk = events.len();
+        println!("[INFO] Device {}: removed labeled event; total_labels={}", device.ip, events.len());
+        device.live.remove_label(key);
         Ok(StatusCode::OK)
     }).await
 }
@@ -424,15 +539,15 @@ async fn post_raw(
         let mut device = lock_or_500(&device, "device")?;
         device.touch();
         let path = device.raw_path();
-        let mut chunks: Vec<SampleChunk> = read_json_array_or_500(&path, "POST /api/raw")?;
-
         let sample_count = sample_chunk.samples.len();
-        let live_copy = sample_chunk.clone();
-        chunks.push(sample_chunk);
-        write_json_or_500(&path, &chunks, true, "POST /api/raw")?;
+        append_json_array_element(&path, &sample_chunk).map_err(|error| {
+            eprintln!("[ERROR] POST /api/raw: cannot append to {}: {error}", path.display());
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        device.chunks_on_disk += 1;
 
-        println!("[INFO] Device {}: appended {sample_count} raw samples; total_chunks={}", device.ip, chunks.len());
-        device.live.push_chunk(live_copy);
+        println!("[INFO] Device {}: appended {sample_count} raw samples; total_chunks={}", device.ip, device.chunks_on_disk);
+        device.live.push_chunk(sample_chunk);
         Ok(StatusCode::OK)
     }).await
 }
@@ -456,15 +571,35 @@ struct LiveLabel {
     event: LabeledEvent,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct LiveRemoval {
+    seq: u64,
+    #[serde(flatten)]
+    key: LabelKey,
+}
+
 struct LiveBuffer {
     next_seq: u64,
     chunks: VecDeque<LiveChunk>,
     labels: VecDeque<LiveLabel>,
+    /// Labels deleted after they were served, so a viewer that already drew the marker removes it.
+    removed: VecDeque<LiveRemoval>,
 }
 
 impl LiveBuffer {
     fn new() -> Self {
-        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new() }
+        LiveBuffer { next_seq: 1, chunks: VecDeque::new(), labels: VecDeque::new(), removed: VecDeque::new() }
+    }
+
+    fn remove_label(&mut self, key: LabelKey) -> u64 {
+        self.labels.retain(|l| !(l.event.timestamp == key.timestamp && l.event.label == key.label));
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.removed.push_back(LiveRemoval { seq, key });
+        while self.removed.len() > LIVE_LABEL_CAPACITY {
+            self.removed.pop_front();
+        }
+        seq
     }
 
     fn push_chunk(&mut self, chunk: SampleChunk) -> u64 {
@@ -495,6 +630,7 @@ impl LiveBuffer {
             next: self.next_seq.saturating_sub(1),
             chunks: self.chunks.iter().filter(|c| first_new(c.seq)).cloned().collect(),
             labels: self.labels.iter().filter(|l| first_new(l.seq)).cloned().collect(),
+            removed: self.removed.iter().filter(|r| first_new(r.seq)).cloned().collect(),
         }
     }
 }
@@ -507,6 +643,8 @@ struct LiveResponse {
     next: u64,
     chunks: Vec<LiveChunk>,
     labels: Vec<LiveLabel>,
+    /// Labels deleted since `after`; drop their markers.
+    removed: Vec<LiveRemoval>,
 }
 
 #[derive(Deserialize)]
@@ -542,8 +680,18 @@ async fn get_raw_live(Query(query): Query<LiveQuery>) -> Result<Json<LiveRespons
     Ok(Json(response))
 }
 
-async fn get_ui() -> Html<&'static str> {
-    Html(UI_HTML)
+/// Prefer the page on disk so UI edits apply on a browser reload without restarting the
+/// server; the copy compiled into the binary is the fallback (for example when run from another directory).
+async fn get_ui() -> Html<String> {
+    match fs::read_to_string(UI_HTML_PATH) {
+        Ok(html) => Html(html),
+        Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!("[WARN] GET /: cannot read {UI_HTML_PATH}: {error}; serving the built-in page");
+            }
+            Html(UI_HTML.to_owned())
+        }
+    }
 }
 
 async fn post_readings(
@@ -915,6 +1063,88 @@ mod tests {
         assert_eq!(after_first.chunks.len(), 1);
         assert_eq!(after_first.chunks[0].chunk.started_at, "b");
         assert_eq!(after_first.labels.len(), 1);
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("duobiu-server-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn append_creates_a_file_and_keeps_it_a_valid_array() {
+        let path = temp_file("append-new.json");
+        append_json_array_element(&path, &chunk("a")).unwrap();
+        append_json_array_element(&path, &chunk("b")).unwrap();
+        append_json_array_element(&path, &chunk("c")).unwrap();
+        let parsed: Vec<SampleChunk> = read_json_array(&path).unwrap();
+        assert_eq!(parsed.iter().map(|c| c.started_at.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn append_continues_files_written_by_serde_pretty_and_empty_arrays() {
+        // Files written by the previous server version (whole pretty-printed array) and `[]` placeholders.
+        let path = temp_file("append-existing.json");
+        fs::write(&path, serde_json::to_string_pretty(&vec![chunk("old1"), chunk("old2")]).unwrap()).unwrap();
+        append_json_array_element(&path, &chunk("new")).unwrap();
+        let parsed: Vec<SampleChunk> = read_json_array(&path).unwrap();
+        assert_eq!(parsed.iter().map(|c| c.started_at.as_str()).collect::<Vec<_>>(), ["old1", "old2", "new"]);
+
+        for empty in ["[]", "[ ]\n", "[\n]\n", "", "   \n"] {
+            fs::write(&path, empty).unwrap();
+            append_json_array_element(&path, &chunk("only")).unwrap();
+            let parsed: Vec<SampleChunk> = read_json_array(&path).unwrap();
+            assert_eq!(parsed.len(), 1, "after appending to {empty:?}");
+            assert_eq!(parsed[0].started_at, "only");
+        }
+    }
+
+    #[test]
+    fn append_refuses_a_file_that_is_not_an_array() {
+        let path = temp_file("append-bad.json");
+        fs::write(&path, "{\"thresholds\": []}").unwrap();
+        assert!(append_json_array_element(&path, &chunk("x")).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"thresholds\": []}");
+    }
+
+    #[test]
+    fn append_survives_a_label_file_rewritten_by_delete() {
+        let path = temp_file("append-labels.json");
+        let event = LabeledEvent { timestamp: 1, latitude: 54.0, longitude: 25.0, label: EventLabel::Bump };
+        append_json_array_element(&path, &event).unwrap();
+        append_json_array_element(&path, &event).unwrap();
+        let mut events: Vec<LabeledEvent> = read_json_array(&path).unwrap();
+        events.remove(0);
+        write_json_or_500(&path, &events, true, "test").unwrap();
+        append_json_array_element(&path, &event).unwrap();
+        let events: Vec<LabeledEvent> = read_json_array(&path).unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn live_buffer_remove_label_drops_it_and_tells_later_pollers() {
+        let mut buffer = LiveBuffer::new();
+        let event = LabeledEvent { timestamp: 5, latitude: 54.0, longitude: 25.0, label: EventLabel::Pothole };
+        buffer.push_label(event.clone());
+        buffer.push_label(LabeledEvent { label: EventLabel::Bump, ..event.clone() });
+        let seen = buffer.since(0, None).next;
+        assert_eq!(buffer.labels.len(), 2);
+
+        buffer.remove_label(LabelKey { timestamp: 5, label: EventLabel::Pothole });
+        assert_eq!(buffer.labels.len(), 1);
+        assert_eq!(buffer.labels[0].event.label, EventLabel::Bump);
+
+        let update = buffer.since(seen, None);
+        assert!(update.labels.is_empty());
+        assert_eq!(update.removed.len(), 1);
+        assert_eq!(update.removed[0].key.timestamp, 5);
+        let json = serde_json::to_value(&update).unwrap();
+        assert_eq!(json["removed"][0]["label"], "pothole");
+
+        // A fresh viewer never sees the removed label at all.
+        assert_eq!(buffer.since(0, None).labels.len(), 1);
     }
 
     #[test]

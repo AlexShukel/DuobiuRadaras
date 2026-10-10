@@ -41,13 +41,16 @@ h1 { font-size: 1.05rem; margin: 0 8px 0 0; }
 .controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
 select, button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px; }
-button { cursor: pointer; } button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--x); outline-offset: 1px; }
+button { cursor: pointer; } button:disabled { opacity: 0.5; cursor: default; }
+button.add { font-weight: 600; padding: 3px 10px; transition: background 0.15s; } button.add.hit { background: var(--grid); } button.pothole { border-color: var(--pothole); color: var(--pothole); } button.bump { border-color: var(--bump); color: var(--bump); } button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--x); outline-offset: 1px; }
 main { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 0 16px 12px; overflow-y: auto; }
 .panel { flex: 1 1 0; min-height: 240px; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
 .panel .strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 6px 12px; border-bottom: 1px solid var(--border); }
 .panel .strip h2 { font-size: 0.95rem; margin: 0 6px 0 0; font-variant-numeric: tabular-nums; }
 .panel .plot { flex: 1; min-height: 160px; position: relative; }
 canvas { width: 100%; height: 100%; display: block; touch-action: pan-y; }
+.panel.marking canvas { cursor: crosshair; }
+.note { font-size: 0.78rem; color: var(--muted); } .note.ok { color: var(--good); } .note.err { color: var(--bad); }
 .tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 4px;
   padding: 6px 8px; font-size: 0.78rem; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; display: none; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
 .tip b { color: var(--ink); }
@@ -65,7 +68,9 @@ footer a { color: var(--ink-2); }
 <div class="controls">
   <label>window <select id="window">
     <option value="30">30 s</option><option value="60">1 min</option><option value="120" selected>2 min</option>
-    <option value="300">5 min</option><option value="600">10 min</option></select></label>
+    <option value="300">5 min</option><option value="600">10 min</option><option value="1800">30 min</option>
+    <option value="3600">1 h</option><option value="10800">3 h</option><option value="21600">6 h</option>
+    <option value="all">all</option></select></label>
   <label><input type="checkbox" id="chX" checked><i class="sw" style="background:var(--x)"></i>x</label>
   <label><input type="checkbox" id="chY" checked><i class="sw" style="background:var(--y)"></i>y</label>
   <label><input type="checkbox" id="chZ" checked><i class="sw" style="background:var(--z)"></i>z</label>
@@ -77,16 +82,22 @@ footer a { color: var(--ink-2); }
 <main id="panels">
   <div id="empty">Waiting for the first device to POST /api/raw</div>
 </main>
-<footer>Each device (identified by its IP) gets its own chart. Polls <a href="/api/devices">/api/devices</a> and <a href="/api/raw">/api/raw?device=&lt;ip&gt;</a> every second; keeps the last 10 minutes per device in the browser and on the server, which writes everything to devices/&lt;ip&gt;/raw.json.</footer>
+<footer>Each device (identified by its IP) gets its own chart. "+ pothole" / "+ bump" on a panel label that device right now (like the button in the phone app); keys: Q/A for the first device, W/S for the second, E/D for the third (top row = pothole, home row = bump). Hover a chart and press <b>1</b> (pothole) or <b>2</b> (bump) to place a label exactly at the cursor's moment. <b>Ctrl+Z</b> undoes the last label added from this page (on the hovered device, or anywhere when nothing is hovered); labels sent from a phone are never undone here. "on chart" plus a click marks an earlier moment instead. Both are saved to that device's labels.json like a label from the phone. Polls <a href="/api/devices">/api/devices</a> and <a href="/api/raw">/api/raw?device=&lt;ip&gt;</a> every second; keeps the last 6 hours per device in the browser and on the server, which writes everything to devices/&lt;ip&gt;/raw.json.</footer>
 <script>
 (function () {
   "use strict";
-  const PERIOD_MS = 25, KEEP_MS = 10 * 60 * 1000, POLL_MS = 1000;
+  const PERIOD_MS = 25, KEEP_MS = 6 * 60 * 60 * 1000, POLL_MS = 1000;   // the server buffers the same 6 hours
   const $ = (id) => document.getElementById(id);
   const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const PAD = { l: 48, r: 14, t: 24, b: 26 };
   let paused = false, lastServerOk = null;
   const panels = new Map();          // device ip -> Panel, in order of first appearance
+  let hoveredPanel = null;           // the panel under the pointer: keys 1 / 2 place a label at the cursor's time
+  const added = [];                  // labels added from this page, oldest first: Ctrl+Z undoes the newest
+  // Keyboard: column = device (panel order), top row = pothole, home row = bump. Layout-independent via ev.code.
+  const POTHOLE_KEYS = ["KeyQ", "KeyW", "KeyE", "KeyR", "KeyT", "KeyY", "KeyU", "KeyI", "KeyO", "KeyP"];
+  const BUMP_KEYS = ["KeyA", "KeyS", "KeyD", "KeyF", "KeyG", "KeyH", "KeyJ", "KeyK", "KeyL", "Semicolon"];
+  const keyName = (code) => code.replace("Key", "").replace("Semicolon", ";");
 
   function parseStart(value) {
     if (typeof value === "number") return value;
@@ -98,7 +109,16 @@ footer a { color: var(--ink-2); }
     const raw = span / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
     return [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag;
   }
-  function timeStep(windowS) { return windowS <= 30 ? 5 : windowS <= 60 ? 10 : windowS <= 120 ? 20 : windowS <= 300 ? 60 : 120; }
+  function timeStep(windowS) {
+    return windowS <= 30 ? 5 : windowS <= 60 ? 10 : windowS <= 120 ? 20 : windowS <= 300 ? 60 : windowS <= 600 ? 120
+      : windowS <= 1800 ? 300 : windowS <= 3600 ? 600 : windowS <= 10800 ? 1800 : windowS <= 21600 ? 3600 : 7200;
+  }
+  /** Selected window in seconds; "all" spans everything this panel holds (at least a minute). */
+  function windowSeconds(T) {
+    const v = $("window").value;
+    if (v !== "all") return Number(v);
+    return T.length ? Math.max(60, (T[T.length - 1] - T[0]) / 1000 + 1) : 60;
+  }
   function clock(ms) { const d = new Date(ms); return d.toTimeString().slice(0, 8); }
   function activeSeries(p) {
     return [
@@ -123,14 +143,31 @@ footer a { color: var(--ink-2); }
         `<div class="strip"><h2></h2><span class="pill offline"><i></i><span class="st">connecting</span></span>` +
         `<span class="stat">last chunk <b class="age">–</b></span><span class="stat">chunks <b class="chunks">0</b></span>` +
         `<span class="stat">rate <b class="rate">–</b> Hz</span><span class="stat">position <b class="pos">–</b></span>` +
-        `<span class="stat">labels <b class="labels">0</b></span><span class="stat">calibration <b class="cal">–</b></span></div>` +
+        `<span class="stat">labels <b class="labels">0</b></span><span class="stat">calibration <b class="cal">–</b></span>` +
+        `<span class="stat" style="margin-left:auto">label now <button type="button" class="add pothole">+ pothole</button> <button type="button" class="add bump">+ bump</button></span>` +
+        `<label class="stat">on chart <select class="mode"><option value="">off</option><option value="pothole">pothole</option><option value="bump">bump</option></select></label>` +
+        `<span class="note"></span></div>` +
         `<div class="plot"><canvas></canvas><div class="tip"></div></div>`;
       el.querySelector("h2").textContent = device;
+      const slot = panels.size;      // panel order decides the key column
+      this.keys = { pothole: POTHOLE_KEYS[slot], bump: BUMP_KEYS[slot] };
+      for (const label of ["pothole", "bump"]) {
+        const b = el.querySelector(`button.${label}`);
+        if (this.keys[label]) { b.textContent = `+ ${label} [${keyName(this.keys[label])}]`; b.title = `key ${keyName(this.keys[label])}`; }
+      }
       this.el = el;
       this.canvas = el.querySelector("canvas"); this.ctx = this.canvas.getContext("2d"); this.tip = el.querySelector(".tip");
       this.q = (sel) => el.querySelector(sel);
       this.canvas.addEventListener("pointermove", (ev) => this.onMove(ev));
-      this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.tip.style.display = "none"; this.dirty = true; });
+      this.canvas.addEventListener("pointerleave", () => { this.hover = null; hoveredPanel = null; this.tip.style.display = "none"; this.dirty = true; });
+      this.canvas.addEventListener("click", (ev) => this.onClick(ev));
+      this.q("button.pothole").addEventListener("click", () => this.addNow("pothole"));
+      this.q("button.bump").addEventListener("click", () => this.addNow("bump"));
+      this.q(".mode").addEventListener("change", () => {
+        const mode = this.q(".mode").value;
+        el.classList.toggle("marking", !!mode);
+        this.note(mode ? `click the chart to add a ${mode}` : "", "");
+      });
       $("panels").appendChild(el);
       this.resize();
     }
@@ -163,6 +200,7 @@ footer a { color: var(--ink-2); }
       if (paused) return;
       body.chunks.forEach((c) => this.addChunk(c));
       body.labels.forEach((l) => this.labels.push({ t: l.timestamp, label: l.label }));
+      (body.removed || []).forEach((r) => this.dropLabel(r.timestamp, r.label));
       this.labels.sort((a, b) => a.t - b.t);
       this.cursor = body.next;
       this.trim();
@@ -206,7 +244,7 @@ footer a { color: var(--ink-2); }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, W, H);
       ctx.font = "11px " + css("--font");
-      const windowS = Number($("window").value);
+      const windowS = windowSeconds(T);
       const tEnd = T.length ? T[T.length - 1] : Date.now(), tStart = tEnd - windowS * 1000;
       const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
       const xOf = (t) => PAD.l + (t - tStart) / (windowS * 1000) * plotW;
@@ -237,9 +275,11 @@ footer a { color: var(--ink-2); }
       }
       ctx.textAlign = "center"; ctx.textBaseline = "top";
       const ts = timeStep(windowS) * 1000;
-      for (let t = Math.ceil(tStart / ts) * ts; t <= tEnd; t += ts) {
+      const labelEvery = Math.max(1, Math.ceil(64 / (ts / (windowS * 1000) * plotW)));   // keep tick labels at least 64 px apart
+      let tick = 0;
+      for (let t = Math.ceil(tStart / ts) * ts; t <= tEnd; t += ts, tick++) {
         const x = xOf(t); ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H - PAD.b); ctx.stroke();
-        ctx.fillText(clock(t), x, H - PAD.b + 6);
+        if (tick % labelEvery === 0) ctx.fillText(clock(t), x, H - PAD.b + 6);
       }
       ctx.strokeStyle = css("--axis"); ctx.beginPath(); ctx.moveTo(PAD.l, H - PAD.b); ctx.lineTo(W - PAD.r, H - PAD.b); ctx.stroke();
       if (lo < 0 && hi > 0) { ctx.beginPath(); ctx.moveTo(PAD.l, yOf(0)); ctx.lineTo(W - PAD.r, yOf(0)); ctx.stroke(); }
@@ -258,13 +298,26 @@ footer a { color: var(--ink-2); }
       // series
       ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, PAD.t, plotW, plotH); ctx.clip();
       ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round";
+      const dense = (i1 - i0) > plotW * 3;   // long windows: draw each pixel column's min..max instead of every sample
       for (const [, A, token] of series) {
         ctx.strokeStyle = css(token); ctx.beginPath();
-        let pen = false;
-        for (let i = i0; i < i1; i++) {
-          if (i > i0 && T[i] - T[i - 1] > PERIOD_MS * 4) pen = false;   // gap between packets: lift the pen
-          const x = xOf(T[i]), y = yOf(A[i]);
-          if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+        if (dense) {
+          let col = -1, lo = 0, hi = 0, tLast = 0;
+          const flush = () => { if (col < 0) return; const x = PAD.l + col + 0.5; ctx.moveTo(x, yOf(hi)); ctx.lineTo(x, yOf(lo)); };
+          for (let i = i0; i < i1; i++) {
+            const c = Math.floor((T[i] - tStart) / (windowS * 1000) * plotW);
+            if (c !== col) { flush(); col = c; lo = hi = A[i]; }
+            else { if (A[i] < lo) lo = A[i]; if (A[i] > hi) hi = A[i]; }
+            tLast = T[i];
+          }
+          flush();
+        } else {
+          let pen = false;
+          for (let i = i0; i < i1; i++) {
+            if (i > i0 && T[i] - T[i - 1] > PERIOD_MS * 4) pen = false;   // gap between packets: lift the pen
+            const x = xOf(T[i]), y = yOf(A[i]);
+            if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+          }
         }
         ctx.stroke();
       }
@@ -291,16 +344,89 @@ footer a { color: var(--ink-2); }
       }
     }
 
-    onMove(ev) {
+    /** Index of the sample nearest to the pointer's x position, or null without data. */
+    indexAt(ev) {
       const T = this.T;
-      if (!T.length) return;
+      if (!T.length) return null;
       const r = this.canvas.getBoundingClientRect(), W = r.width;
-      const windowS = Number($("window").value), tEnd = T[T.length - 1], tStart = tEnd - windowS * 1000;
+      const windowS = windowSeconds(T), tEnd = T[T.length - 1], tStart = tEnd - windowS * 1000;
       const t = tStart + (ev.clientX - r.left - PAD.l) / (W - PAD.l - PAD.r) * windowS * 1000;
       let lo = 0, hi = T.length - 1;
       while (lo < hi) { const mid = (lo + hi) >> 1; if (T[mid] < t) lo = mid + 1; else hi = mid; }
       if (lo > 0 && Math.abs(T[lo - 1] - t) < Math.abs(T[lo] - t)) lo--;
-      this.hover = lo; this.dirty = true;
+      return lo;
+    }
+
+    note(text, cls) {
+      const n = this.q(".note"); n.textContent = text; n.className = `note ${cls}`;
+    }
+
+    /** The "+ pothole" / "+ bump" buttons and their keys: label this moment, at the device's latest known position. */
+    addNow(label) {
+      const b = this.q(`button.${label}`); b.classList.add("hit"); setTimeout(() => b.classList.remove("hit"), 200);
+      const n = this.T.length;
+      if (!n) { this.note("no data from this device yet", "err"); return; }
+      this.send({ timestamp: Date.now(), latitude: this.LAT[n - 1], longitude: this.LON[n - 1], label });
+    }
+
+    /** Remove the newest marker matching a deleted label; returns whether one was found. */
+    dropLabel(timestamp, label) {
+      for (let i = this.labels.length - 1; i >= 0; i--) {
+        if (this.labels[i].t === timestamp && this.labels[i].label === label) { this.labels.splice(i, 1); this.dirty = true; return true; }
+      }
+      return false;
+    }
+
+    /** Ctrl+Z: delete the newest label this page added to this device (never one sent from the phone). */
+    async undo(entry) {
+      const r = await fetch(`/api/label?device=${encodeURIComponent(this.device)}`, {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timestamp: entry.timestamp, label: entry.label }),
+      });
+      if (r.status === 404) { this.note(`${entry.label} at ${clock(entry.timestamp)} was already removed`, "err"); return; }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      this.dropLabel(entry.timestamp, entry.label);
+      this.note(`undid ${entry.label} at ${clock(entry.timestamp)}`, "ok");
+    }
+
+    /** Keys 1 / 2 while hovering: label the sample under the cursor. */
+    addAtCursor(label) {
+      const i = this.hover;
+      if (i === null || i >= this.T.length) { this.note("hover the chart over the moment to label", "err"); return; }
+      this.send({ timestamp: this.T[i], latitude: this.LAT[i], longitude: this.LON[i], label });
+    }
+
+    /** With an "on chart" mode selected, a click stores a label at the nearest sample's time and position. */
+    onClick(ev) {
+      const label = this.q(".mode").value;
+      if (!label) return;
+      const i = this.indexAt(ev);
+      if (i === null) { this.note("no data to label yet", "err"); return; }
+      this.send({ timestamp: this.T[i], latitude: this.LAT[i], longitude: this.LON[i], label });
+    }
+
+    async send(event) {
+      const label = event.label;
+      this.q("button.pothole").disabled = this.q("button.bump").disabled = true;
+      try {
+        const r = await fetch(`/api/label?device=${encodeURIComponent(this.device)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(event),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        // The marker arrives through the next poll, like labels sent from the phone.
+        added.push({ panel: this, timestamp: event.timestamp, label });
+        this.note(`${label} added at ${clock(event.timestamp)}`, "ok");
+      } catch (err) {
+        this.note(`could not add ${label}: ${err.message}`, "err");
+      } finally {
+        this.q("button.pothole").disabled = this.q("button.bump").disabled = false;
+      }
+    }
+
+    onMove(ev) {
+      const T = this.T, lo = this.indexAt(ev);
+      if (lo === null) return;
+      this.hover = lo; hoveredPanel = this; this.dirty = true;
       this.tip.innerHTML = `<b>${clock(T[lo])}</b>.${String(T[lo] % 1000).padStart(3, "0")}<br>` +
         `x <b>${this.X[lo].toFixed(2)}</b> &nbsp;y <b>${this.Y[lo].toFixed(2)}</b> &nbsp;z <b>${this.Z[lo].toFixed(2)}</b> &nbsp;|a| <b>${this.M[lo].toFixed(2)}</b><br>` +
         `${this.LAT[lo].toFixed(6)}, ${this.LON[lo].toFixed(6)}`;
@@ -318,6 +444,7 @@ footer a { color: var(--ink-2); }
       const r = await fetch("/api/devices", { cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const devices = await r.json();
+      devices.sort((a, b) => a.device.localeCompare(b.device));   // stable panel order (and key columns) across reloads
       for (const d of devices) {
         if (!panels.has(d.device)) {
           panels.set(d.device, new Panel(d.device));
@@ -362,6 +489,42 @@ footer a { color: var(--ink-2); }
     paused = !paused; $("pause").textContent = paused ? "Resume" : "Pause"; setStatus();
   });
   window.addEventListener("resize", () => panels.forEach((p) => p.resize()));
+  async function undoLast() {
+    // Prefer the hovered device; otherwise the newest label added from this page on any device.
+    let i = added.length - 1;
+    if (hoveredPanel) { while (i >= 0 && added[i].panel !== hoveredPanel) i--; }
+    if (i < 0) { (hoveredPanel || [...panels.values()][0])?.note("nothing to undo", "err"); return; }
+    const [entry] = added.splice(i, 1);
+    try {
+      await entry.panel.undo(entry);
+    } catch (err) {
+      added.splice(i, 0, entry);          // keep it so the user can retry
+      entry.panel.note(`could not undo ${entry.label}: ${err.message}`, "err");
+    }
+  }
+
+  window.addEventListener("keydown", (ev) => {
+    if ((ev.ctrlKey || ev.metaKey) && ev.code === "KeyZ" && !ev.shiftKey && !ev.altKey) {
+      if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) return;
+      ev.preventDefault();
+      if (!ev.repeat) undoLast();
+      return;
+    }
+    if (ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName)) return;   // typing in a control
+    if (ev.code === "Digit1" || ev.code === "Digit2" || ev.code === "Numpad1" || ev.code === "Numpad2") {
+      if (!hoveredPanel) return;
+      ev.preventDefault();
+      hoveredPanel.addAtCursor(ev.code.endsWith("1") ? "pothole" : "bump");
+      return;
+    }
+    const ordered = [...panels.values()];
+    let slot = POTHOLE_KEYS.indexOf(ev.code), label = "pothole";
+    if (slot < 0) { slot = BUMP_KEYS.indexOf(ev.code); label = "bump"; }
+    if (slot < 0 || slot >= ordered.length) return;
+    ev.preventDefault();
+    ordered[slot].addNow(label);
+  });
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", redrawAll);
   setInterval(setStatus, 1000);
 
