@@ -8,6 +8,7 @@ use axum::{extract::Request, middleware::{self, Next}, response::Response};
 const WINDOW_SIZE: usize = 20;
 const CALIBRATION_TABLE_PATH: &str = "./calibration.json";
 const POTHOLES_PATH: &str = "./potholes.json";
+const RAW: &str = "./raw.json";
 const POTHOLE_GROUP_RADIUS_M: f64 = 10.0;
 
 #[derive(Deserialize, Serialize, Debug, PartialEq)]
@@ -16,13 +17,13 @@ struct PotholeLocation {
     longitude: f64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
 struct SampleChunk {
     started_at: String, // in milliseconds
     samples: Vec<Sample>
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Serialize)]
 struct Sample {
     x: f64,
     y: f64,
@@ -43,6 +44,7 @@ async fn main() -> io::Result<()> {
         .route("/api/potholes", get(get_potholes))
         .route("/api/calibration", post(post_calibration))
         .route("/api/health", get(get_health))
+        .route("/api/raw", post(post_raw))
         .layer(middleware::from_fn(log_request));
 
     println!("[INFO] Starting server: window_size={WINDOW_SIZE}, grouping_radius_m={POTHOLE_GROUP_RADIUS_M}");
@@ -73,6 +75,49 @@ async fn get_health() -> StatusCode {
     println!("[INFO] GET /api/health: status=200");
 
     StatusCode::OK
+}
+
+static RAW_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+async fn post_raw(
+    Json(sample_chunk): Json<SampleChunk>,
+) -> Result<StatusCode, StatusCode> {
+    let _guard = RAW_FILE_LOCK.lock().map_err(|error| {
+        eprintln!("[ERROR] POST /api/raw: lock failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut chunks: Vec<SampleChunk> = match fs::read_to_string(RAW) {
+        Ok(json) => serde_json::from_str(&json).map_err(|error| {
+            eprintln!("[ERROR] POST /api/raw: invalid JSON in {RAW}: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            eprintln!("[ERROR] POST /api/raw: cannot read {RAW}: {error}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let sample_count = sample_chunk.samples.len();
+    chunks.push(sample_chunk);
+
+    let json = serde_json::to_string_pretty(&chunks).map_err(|error| {
+        eprintln!("[ERROR] POST /api/raw: serialization failed: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    fs::write(RAW, json).map_err(|error| {
+        eprintln!("[ERROR] POST /api/raw: cannot write {RAW}: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    println!(
+        "[INFO] Appended {sample_count} raw samples; total_chunks={}",
+        chunks.len()
+    );
+
+    Ok(StatusCode::OK)
 }
 
 async fn post_readings(Json(sample_chunk): Json<SampleChunk>) -> Result<StatusCode, StatusCode> {
